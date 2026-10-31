@@ -77,4 +77,4 @@ jobs:
         if: always() && github.event.action == 'labeled'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh pr edit "${{ github.event.pull_request.number }}" -R "${{ github.repository }}" --remove-label "${{ inputs.trigger_label }}"
+        run: gh api -X DELETE "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/${{ inputs.trigger_label }}" --silent
