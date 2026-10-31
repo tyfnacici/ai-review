@@ -12,11 +12,17 @@ on:
         description: PRs whose head is this branch get a release review (combined effect); all others a feature review
         type: string
         default: staging
+      trigger_label:
+        description: Adding this label to a PR runs the review again (follow-up); the label is removed afterwards
+        type: string
+        default: ai-review
 
 jobs:
   secrets:
-    # Deterministic secret scan of the lines this PR adds; fails the check on a leak (values are redacted).
-    if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
+    # Deterministic secret scan of the lines this PR adds, on every push; fails the check on a leak (values are redacted).
+    if: >-
+      github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
+      && github.event.action != 'labeled'
     runs-on: [self-hosted, s10-review]
     timeout-minutes: 5
     env:
@@ -39,8 +45,12 @@ jobs:
             | { grep '^+' || true; } | "$bin" stdin --redact --no-banner -v
 
   review:
-    # Skip drafts and fork PRs (forks get no secrets and must never reach the s10 runner).
-    if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
+    # Runs when the PR is opened or marked ready, and again whenever the trigger label is added; not on every push.
+    # Drafts and fork PRs are skipped (forks get no secrets and must never reach the s10 runner).
+    if: >-
+      github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
+      && (contains(fromJSON('["opened", "reopened", "ready_for_review"]'), github.event.action)
+          || (github.event.action == 'labeled' && github.event.label.name == inputs.trigger_label))
     runs-on: [self-hosted, s10-review]
     timeout-minutes: 20
     steps:
@@ -62,3 +72,9 @@ jobs:
           MODEL: ${{ inputs.model }}
           MODE: ${{ github.head_ref == inputs.release_from && 'release' || 'feature' }}
         run: '"$HOME/ai-review/run.sh"'
+
+      - name: Remove trigger label
+        if: always() && github.event.action == 'labeled'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr edit "${{ github.event.pull_request.number }}" -R "${{ github.repository }}" --remove-label "${{ inputs.trigger_label }}"

@@ -6,8 +6,11 @@ Everything runs on the self-hosted runner `s10-review` (a phone at home), so eve
 ## What runs on a PR
 | Job | What it does | Fails the check? |
 |---|---|---|
-| `secrets` | [gitleaks](https://github.com/gitleaks/gitleaks) scans the lines the PR adds (values redacted in the log) | yes, on a leak |
-| `review` | AI review posted as one PR review by `github-actions[bot]` | no, advisory only |
+| `secrets` | every push: [gitleaks](https://github.com/gitleaks/gitleaks) scans the lines the PR adds (values redacted in the log) | yes, on a leak |
+| `review` | when the PR is opened / marked ready, and again each time you add the `ai-review` label: AI review posted as one PR review by `github-actions[bot]` | no, advisory only |
+
+Pushes do not trigger the AI review. When you are done with the fixes, add the `ai-review` label to the PR; the
+review runs and removes the label, so you can add it again later.
 
 ## How the AI review works
 1. Collect the PR title, description, discussion, changed files and diff with `gh`, plus the project rulebook
@@ -21,7 +24,7 @@ Everything runs on the self-hosted runner `s10-review` (a phone at home), so eve
    | simplicity | KISS: out-of-scope changes, over-engineering, too much code, not following project structure, new deps, needless comments | universal code quality |
 
    A synthesis pass verifies every candidate against the code, merges duplicates and writes the review.
-3. **Every later push:** one short follow-up call on the changes since the last review. Earlier findings are re-checked as
+3. **Every later review (label):** one short follow-up call on the changes since the last review. Earlier findings are re-checked as
    fixed / still open / deferred / no longer applies / not a defect; the bot replies "Fixed in <sha>" on its own threads and
    resolves them. New findings must be P0-P2 on newly changed lines (P0 anywhere); from the 4th review on, only P0/P1.
    When nothing is left it says "No new comments", so a PR converges instead of looping.
@@ -62,9 +65,9 @@ The mode is picked from the PR's head branch (`release_from` input, default `sta
    on:
      pull_request:
        branches: [main, staging]
-       types: [opened, synchronize, reopened, ready_for_review]
+       types: [opened, synchronize, reopened, ready_for_review, labeled]
    concurrency:
-     group: ai-review-${{ github.event.pull_request.number }}
+     group: ai-review-${{ github.event.pull_request.number }}-${{ github.event.action }}-${{ github.event.label.name }}
      cancel-in-progress: true
    permissions:
      contents: write       # only so the bot can resolve its own fixed threads (GitHub requires it)
@@ -73,8 +76,9 @@ The mode is picked from the PR's head branch (`release_from` input, default `sta
      review:
        uses: tyfnacici/ai-review/.github/workflows/review.yml@main
    ```
-3. Keep the project's `CLAUDE.md` up to date; it is the review rulebook.
-4. Turn on Dependabot alerts for the repo (alerts only; no automatic PRs needed).
+3. Create the label once: `gh label create ai-review -R <owner>/<repo> --description "Run the AI review again"`.
+4. Keep the project's `CLAUDE.md` up to date; it is the review rulebook.
+5. Turn on Dependabot alerts for the repo (alerts only; no automatic PRs needed).
 
 ## Settings (runner environment)
 | Variable | Default | Meaning |
