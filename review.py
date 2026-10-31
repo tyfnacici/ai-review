@@ -128,6 +128,8 @@ def previous_review(reviews):
                 findings = json.loads(base64.b64decode(m.group(2)) or b"[]")
             except ValueError:
                 findings = []
+            for i, f in enumerate(findings, 1):
+                f["id"] = f"p{i}"
             return {"head": m.group(1), "findings": findings}
     return None
 
@@ -143,7 +145,7 @@ def pr_prompt(meta, diff, inline_comments, prior):
     prior_txt = "(none: this is the first Müsli review of this PR)"
     if prior and prior["findings"]:
         prior_txt = (f"Previous Müsli review was at commit {prior['head'][:7]}. Its findings:\n" +
-                     "\n".join(f"- [{f.get('severity')}] {f.get('title')} ({f.get('path')}:{f.get('line')})"
+                     "\n".join(f"- id={f['id']} [{f.get('severity')}] {f.get('title')} — was at {f.get('path')}:{f.get('line')}"
                                for f in prior["findings"]))
     return (
         f"PR title: {meta['title']}\n"
@@ -219,7 +221,7 @@ def inline_body(f, is_added_line):
     return body
 
 
-def render(result, findings, unanchored, lens_errors, model, elapsed, head_sha):
+def render(result, findings, unanchored, prior_status, lens_errors, model, elapsed, head_sha):
     dc = result.get("description_consistency") or {}
     parts = [f"## 🐔 {BOT_NAME}'s thoughts: {verdict_of(findings)}", (result.get("summary") or "").strip()]
     parts.append(f"**Description vs. changes:** {'✅' if dc.get('ok') else '⚠️'} {(dc.get('notes') or '').strip()}")
@@ -229,11 +231,10 @@ def render(result, findings, unanchored, lens_errors, model, elapsed, head_sha):
         counts = ", ".join(f"{sum(f.get('severity') == s for f in findings)}× {s}" for s in SEVERITIES
                            if any(f.get("severity") == s for f in findings))
         parts.append(f"**Findings:** {counts}")
-    prior = result.get("prior_findings") or []
-    if prior:
+    if prior_status:
         parts.append("**Earlier findings:**\n" + "\n".join(
-            f"- {PRIOR_STATUS_LABEL.get(p.get('status'), p.get('status'))}: {p.get('title')}"
-            f"{' — ' + p['note'] if p.get('note') else ''}" for p in prior))
+            f"- {PRIOR_STATUS_LABEL.get(p.get('status'), p.get('status'))}: {p['title']}"
+            f"{' — ' + p['note'] if p.get('note') else ''}" for p in prior_status))
     if unanchored:
         parts.append("**Other findings** (not tied to a changed line):\n" + "\n".join(
             f"- {finding_md(f, True)}: {f.get('body', '').strip()}" for f in unanchored))
@@ -256,32 +257,38 @@ REPLY = {"resolved": "✅ Fixed in {sha}.", "obsolete": "🗑️ No longer appli
          "rejected": "🚫 On re-check at {sha} this is not a defect."}
 
 
-def close_fixed_threads(repo, pr, prior_status, head, dry_run):
-    """Reply to and resolve Müsli's own inline threads whose finding is no longer open."""
-    done = [p for p in prior_status if p.get("status") in REPLY]
-    if not done:
-        return 0
+def open_bot_threads(repo, pr):
+    """Unresolved inline threads started by Müsli, as dicts with thread id, comment id and title."""
     owner, name = repo.split("/")
     data = json.loads(gh("api", "graphql", "-f", f"query={THREADS_QUERY}", "-F", f"o={owner}",
                          "-F", f"n={name}", "-F", f"p={pr}").stdout)
-    threads = data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+    threads = []
+    for t in data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
+        first = (t["comments"]["nodes"] or [None])[0]
+        if t["isResolved"] or not first or not (first["author"] or {}).get("login", "").startswith("github-actions"):
+            continue
+        title = re.search(r"\*\*(.+?)\*\*", first["body"])
+        threads.append({"id": t["id"], "comment": first["databaseId"], "title": title.group(1) if title else None})
+    return threads
+
+
+def close_fixed_threads(repo, pr, prior_status, threads, head, dry_run):
+    """Reply to and resolve Müsli's own inline threads whose finding is no longer open."""
     closed = 0
-    for p in done:
-        for t in threads:
-            first = (t["comments"]["nodes"] or [None])[0]
-            if (t["isResolved"] or not first or not (first["author"] or {}).get("login", "").startswith("github-actions")
-                    or f"**{p.get('title')}**" not in first["body"]):
-                continue
+    for p in prior_status:
+        if p.get("status") not in REPLY:
+            continue
+        for t in [t for t in threads if t["title"] == p["title"]]:
             text = REPLY[p["status"]].format(sha=head[:7]) + (f" {p['note']}" if p.get("note") else "")
             if dry_run:
                 print(f"would resolve thread {t['id']}: {text}")
             else:
-                gh("api", "-X", "POST", f"repos/{repo}/pulls/{pr}/comments/{first['databaseId']}/replies",
+                gh("api", "-X", "POST", f"repos/{repo}/pulls/{pr}/comments/{t['comment']}/replies",
                    "-f", f"body={text}")
                 res = gh("api", "graphql", "-f", f"query={RESOLVE_MUTATION}", "-F", f"t={t['id']}", check=False)
                 if res.returncode != 0:
                     print(f"warning: could not resolve thread {t['id']}: {res.stderr.strip()}", file=sys.stderr)
-            t["isResolved"] = True
+            threads.remove(t)
             closed += 1
     return closed
 
@@ -333,19 +340,24 @@ def main():
             os.unlink(ctx_path)
     elapsed = time.time() - started
 
+    # Earlier findings are matched by id, so the model cannot drift their titles.
+    prior_by_id = {f["id"]: f for f in (prior or {}).get("findings", [])}
+    prior_status = [dict(p, title=prior_by_id[p["id"]]["title"]) for p in result.get("prior_findings") or []
+                    if p.get("id") in prior_by_id]
     findings = [f for f in result.get("findings", []) if f.get("severity") in SEVERITIES]
+    for f in findings:
+        if f.get("prior_id") in prior_by_id:
+            f["title"] = prior_by_id[f["prior_id"]]["title"]
     findings.sort(key=lambda f: SEVERITIES.index(f["severity"]))
     valid = commentable_lines(diff)
-    # Do not repeat an inline comment Müsli already left on the same line with the same title.
-    posted = {(c["path"], c.get("line"), t) for c in inline if c["user"]["login"].endswith("[bot]")
-              for t in re.findall(r"\*\*(.+?)\*\*", c["body"])[:1]}
+    threads = open_bot_threads(a.repo, a.pr)
+    open_titles = {t["title"] for t in threads}
     anchored, unanchored, skipped = [], [], 0
     for f in findings:
         line = f.get("line")
-        if isinstance(line, int) and line in valid.get(f.get("path"), {}) and len(anchored) < MAX_INLINE:
-            if (f["path"], line, f.get("title")) in posted:
-                skipped += 1
-                continue
+        if f.get("title") in open_titles:  # already has an open Müsli thread; do not repeat it
+            skipped += 1
+        elif isinstance(line, int) and line in valid.get(f.get("path"), {}) and len(anchored) < MAX_INLINE:
             anchored.append(f)
         else:
             unanchored.append(f)
@@ -354,11 +366,11 @@ def main():
     review = {
         "commit_id": head,
         "event": "COMMENT",
-        "body": render(result, findings, unanchored, lens_errors, a.model, elapsed, head),
+        "body": render(result, findings, unanchored, prior_status, lens_errors, a.model, elapsed, head),
         "comments": [{"path": f["path"], "line": f["line"], "side": "RIGHT",
                       "body": inline_body(f, valid[f["path"]][f["line"]])} for f in anchored],
     }
-    closed = close_fixed_threads(a.repo, a.pr, result.get("prior_findings") or [], head, a.dry_run)
+    closed = close_fixed_threads(a.repo, a.pr, prior_status, threads, head, a.dry_run)
     print(json.dumps({"elapsed_s": round(elapsed), "candidates": len(candidates), "findings": len(findings),
                       "inline": len(anchored), "summary_only": len(unanchored), "already_posted": skipped,
                       "threads_resolved": closed, "lens_errors": lens_errors}))
