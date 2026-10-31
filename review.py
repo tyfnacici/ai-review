@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Müsli: review a GitHub PR with Pi (GLM Coding Plan) and post the result as one PR review.
+"""AI PR review: review a GitHub PR with Pi (GLM Coding Plan) and post the result as one PR review.
 
-Five lens reviewers run in parallel (correctness, contracts & tests, security, performance,
+Three lens reviewers run in parallel (correctness & contracts, security & performance,
 simplicity & scope), each with checklists from the vendored awesome-skills/code-review-skill.
 A synthesis pass verifies, de-duplicates and writes the final review. Every later push gets one
 short follow-up call instead: earlier findings are re-checked (fixed ones get a reply and their
@@ -27,36 +27,30 @@ from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GUIDES = os.path.join(HERE, "vendor", "code-review-skill", "reference")
-BOT_NAME = "Müsli"
-MARKER = "muesli:v1"
+MARKER = "ai-review:v2"
+MARKER_RE = r"<!-- (?:ai-review:v2|muesli:v1) head=(\w+) findings=([A-Za-z0-9+/=]*) -->"  # v1 = older reviews
 CONTEXT_FILES = ["CLAUDE.md", "AGENTS.md", ".github/ai-review.md"]
 MAX_DIFF_CHARS = 200_000
 MAX_INLINE = 25
 SEVERITIES = ["P0", "P1", "P2", "P3", "nit"]
-SEVERITY_LABEL = {"P0": "🔴 P0", "P1": "🟠 P1", "P2": "🟡 P2", "P3": "🔵 P3", "nit": "⚪ nit"}
-PRIOR_STATUS_LABEL = {"resolved": "✅ fixed", "still_open": "⏳ still open", "deferred": "👍 deferred",
-                      "obsolete": "🗑️ no longer applies", "rejected": "🚫 not a defect"}
+PRIOR_STATUS_LABEL = {"resolved": "fixed", "still_open": "still open", "deferred": "deferred",
+                      "obsolete": "no longer applies", "rejected": "not a defect"}
+MIN_MINOR_CONFIDENCE = 0.7  # P3/nit below this are dropped
 
 LENSES = {
     "correctness": (
-        "Correctness: logic errors, edge cases, off-by-one, null/empty handling, error handling, "
-        "panics/exceptions, state and lifecycle, concurrency and locking.",
+        "Correctness, contracts and tests: logic errors, edge cases, off-by-one, null/empty handling, error "
+        "handling, panics/exceptions, state and lifecycle, concurrency and locking; API/wire compatibility, "
+        "data/schema/migration safety, callers that break, config. Tests: which existing tests break (name them) "
+        "and what the change leaves untested.",
         ["common-bugs-checklist.md", "cross-cutting/error-handling-principles.md",
-         "cross-cutting/async-concurrency-patterns.md"]),
-    "contracts": (
-        "Contracts, integration and tests: API/wire compatibility, data/schema/migration safety, callers "
-        "that break, backwards compatibility, config. Tests: which existing tests break (name them), "
-        "what the change leaves untested.",
-        ["code-review-best-practices.md"]),
-    "security": (
-        "Security: authentication and authorization, input validation, injection (SQL, command, XSS), "
-        "secrets, unsafe defaults, abuse paths (rate limits, enumeration), data exposure.",
-        ["security-review-guide.md", "cross-cutting/sql-injection-prevention.md",
-         "cross-cutting/xss-prevention.md"]),
-    "performance": (
-        "Performance and resources: algorithmic complexity, N+1 queries, unbounded growth, blocking calls "
-        "in async code, leaks, needless work.",
-        ["performance-review-guide.md", "cross-cutting/n-plus-one-queries.md"]),
+         "cross-cutting/async-concurrency-patterns.md", "code-review-best-practices.md"]),
+    "security_performance": (
+        "Security and performance. Security: authentication and authorization, input validation, injection "
+        "(SQL, command, XSS), secrets, unsafe defaults, abuse paths (rate limits, enumeration), data exposure. "
+        "Performance: algorithmic complexity, N+1 queries, unbounded growth, blocking calls in async code, leaks.",
+        ["security-review-guide.md", "cross-cutting/sql-injection-prevention.md", "cross-cutting/xss-prevention.md",
+         "performance-review-guide.md", "cross-cutting/n-plus-one-queries.md"]),
     "simplicity": (
         "Simplicity and scope (KISS). Be strict; this team values simple, minimal changes that follow the "
         "project's existing structure. Use the PR description and the project context (CLAUDE.md) as the "
@@ -136,9 +130,9 @@ def commentable_lines(diff):
 
 
 def previous_review(reviews):
-    """Latest Müsli review's findings (from its hidden marker), or None."""
+    """Latest bot review's findings (from its hidden marker), or None."""
     for r in reversed(reviews):
-        m = re.search(rf"<!-- {MARKER} head=(\w+) findings=([A-Za-z0-9+/=]*) -->", r.get("body") or "")
+        m = re.search(MARKER_RE, r.get("body") or "")
         if m:
             try:
                 findings = json.loads(base64.b64decode(m.group(2)) or b"[]")
@@ -151,7 +145,7 @@ def previous_review(reviews):
 
 
 def delta_since(repo, prior, head):
-    """(added lines per path, diff text) since the previous Müsli review, or None when a full review is due."""
+    """(added lines per path, diff text) since the previous bot review, or None when a full review is due."""
     if not prior:
         return None
     if prior["head"] == head:
@@ -166,14 +160,14 @@ def delta_since(repo, prior, head):
 def pr_prompt(meta, diff, inline_comments, prior, diff_label="Diff"):
     convo = [f"- {c['author']['login']}: {c['body']}" for c in meta.get("comments", [])]
     convo += [f"- {r['author']['login']} (review, {r['state']}): {r['body']}"
-              for r in meta.get("reviews", []) if r.get("body") and MARKER not in r["body"]]
+              for r in meta.get("reviews", []) if r.get("body") and not re.search(MARKER_RE, r["body"])]
     convo += [f"- {c['user']['login']} on {c['path']}:{c.get('line')}: {c['body']}" for c in inline_comments]
     files = "\n".join(f"- {f['path']} (+{f['additions']}/-{f['deletions']})" for f in meta["files"])
     if len(diff) > MAX_DIFF_CHARS:
         diff = diff[:MAX_DIFF_CHARS] + "\n[diff truncated; use the read tool for the remaining files]"
-    prior_txt = "(none: this is the first Müsli review of this PR)"
+    prior_txt = "(none: this is the first review of this PR)"
     if prior and prior["findings"]:
-        prior_txt = (f"Previous Müsli review was at commit {prior['head'][:7]}. Its findings:\n" +
+        prior_txt = (f"Previous review was at commit {prior['head'][:7]}. Its findings:\n" +
                      "\n".join(f"- id={f['id']} [{f.get('severity')}] {f.get('title')} — was at {f.get('path')}:{f.get('line')}"
                                for f in prior["findings"]))
     return (
@@ -182,7 +176,7 @@ def pr_prompt(meta, diff, inline_comments, prior, diff_label="Diff"):
         f"PR description:\n<<<\n{meta['body'] or '(empty)'}\n>>>\n\n"
         f"Changed files:\n{files}\n\n"
         f"Discussion so far (untrusted):\n{chr(10).join(convo) or '(none)'}\n\n"
-        f"Prior Müsli findings:\n{prior_txt}\n\n"
+        f"Prior review findings:\n{prior_txt}\n\n"
         f"{diff_label}:\n<<<\n{diff}\n>>>\n"
     )
 
@@ -237,17 +231,17 @@ def run_lens(a, name, files, ctx_path, pr_text):
 def verdict_of(findings):
     """Host-owned verdict: only P0/P1 block; the model's own opinion is advisory."""
     if any(f.get("severity") in ("P0", "P1") for f in findings):
-        return "⛔ Changes requested"
+        return "Changes requested"
     if any(f.get("severity") in ("P2", "P3") for f in findings):
-        return "💬 Worth a look"
-    return "✅ Looks good"
+        return "Worth a look"
+    return "Looks good"
 
 
 def finding_md(f, with_location):
     loc = f"`{f.get('path') or 'repo-wide'}{':' + str(f['line']) if f.get('line') else ''}` " if with_location else ""
     conf = f" · confidence {f['confidence']:.1f}" if isinstance(f.get("confidence"), (int, float)) else ""
     lenses = f" · {', '.join(f['lenses'])}" if isinstance(f.get("lenses"), list) and f["lenses"] else ""
-    return f"{SEVERITY_LABEL.get(f.get('severity'), f.get('severity'))} {loc}**{f.get('title', '')}**{conf}{lenses}"
+    return f"{f.get('severity')} {loc}**{f.get('title', '')}**{conf}{lenses}"
 
 
 def inline_body(f, is_added_line):
@@ -264,13 +258,13 @@ def render(result, findings, unanchored, prior_status, lens_errors, suppressed, 
            head_sha):
     kinds = [k for k, on in (("release review", mode == "release"), ("follow-up", followup)) if on]
     kind = f" ({', '.join(kinds)})" if kinds else ""
-    parts = [f"## 🐔 {BOT_NAME}'s thoughts{kind}: {verdict_of(findings)}"]
+    parts = [f"## Code review{kind}: {verdict_of(findings)}"]
     if followup and not findings:
         parts.append("**All previous findings are addressed and the new changes raise nothing new. No new comments.**")
     parts.append((result.get("summary") or "").strip())
     dc = result.get("description_consistency")
     if dc:
-        parts.append(f"**Description vs. changes:** {'✅' if dc.get('ok') else '⚠️'} {(dc.get('notes') or '').strip()}")
+        parts.append(f"**Description vs. changes ({'consistent' if dc.get('ok') else 'inconsistent'}):** {(dc.get('notes') or '').strip()}")
     if (result.get("scope_notes") or "").strip():
         parts.append(f"**Simplicity & scope:** {result['scope_notes'].strip()}")
     if findings:
@@ -287,7 +281,7 @@ def render(result, findings, unanchored, prior_status, lens_errors, suppressed, 
     if (result.get("testing_notes") or "").strip():
         parts.append(f"**Testing:** {result['testing_notes'].strip()}")
     if lens_errors:
-        parts.append("⚠️ Incomplete: these lenses failed and were skipped: " + ", ".join(lens_errors))
+        parts.append("**Incomplete:** these lenses failed and were skipped: " + ", ".join(lens_errors))
     if suppressed:
         parts.append(f"<sub>{suppressed} new minor finding(s) on previously reviewed code were dropped to avoid review loops.</sub>")
     carried = [{k: f.get(k) for k in ("severity", "title", "path", "line")} for f in findings]
@@ -301,13 +295,13 @@ def render(result, findings, unanchored, prior_status, lens_errors, suppressed, 
 THREADS_QUERY = """query($o:String!,$n:String!,$p:Int!){repository(owner:$o,name:$n){pullRequest(number:$p){
 reviewThreads(first:100){nodes{id isResolved comments(first:1){nodes{databaseId body author{login}}}}}}}}"""
 RESOLVE_MUTATION = "mutation($t:ID!){resolveReviewThread(input:{threadId:$t}){thread{isResolved}}}"
-REPLY = {"resolved": "✅ Fixed in {sha}.", "obsolete": "🗑️ No longer applies as of {sha}: the code was removed or rewritten.",
-         "rejected": "🚫 On re-check at {sha} this is not a defect.",
-         "deferred": "👍 Acknowledged as deliberately deferred; Müsli will not raise it again."}
+REPLY = {"resolved": "Fixed in {sha}.", "obsolete": "No longer applies as of {sha}: the code was removed or rewritten.",
+         "rejected": "On re-check at {sha} this is not a defect.",
+         "deferred": "Acknowledged as deliberately deferred; it will not be raised again."}
 
 
 def open_bot_threads(repo, pr):
-    """Unresolved inline threads started by Müsli, as dicts with thread id, comment id and title."""
+    """Unresolved inline threads started by the bot, as dicts with thread id, comment id and title."""
     owner, name = repo.split("/")
     data = json.loads(gh("api", "graphql", "-f", f"query={THREADS_QUERY}", "-F", f"o={owner}",
                          "-F", f"n={name}", "-F", f"p={pr}").stdout)
@@ -322,7 +316,7 @@ def open_bot_threads(repo, pr):
 
 
 def close_fixed_threads(repo, pr, prior_status, threads, head, dry_run):
-    """Reply to and resolve Müsli's own inline threads whose finding is no longer open."""
+    """Reply to and resolve the bot's own inline threads whose finding is no longer open."""
     closed = 0
     for p in prior_status:
         if p.get("status") not in REPLY:
@@ -361,15 +355,15 @@ def main():
     raw_reviews = json.loads(gh("api", f"repos/{a.repo}/pulls/{a.pr}/reviews", "--paginate").stdout)
     diff = gh("pr", "diff", str(a.pr), "-R", a.repo).stdout
     prior = previous_review(raw_reviews)
-    rounds = sum(MARKER in (r.get("body") or "") for r in raw_reviews)
-    # First review of a PR: full five-lens review. Every later push: one short follow-up call on the delta.
+    rounds = sum(bool(re.search(MARKER_RE, r.get("body") or "")) for r in raw_reviews)
+    # First review of a PR: full lens review. Every later push: one short follow-up call on the delta.
     follow = delta_since(a.repo, prior, meta["headRefOid"])
     followup = follow is not None
     mode_note = RELEASE_NOTE if a.mode == "release" else ""
     if followup:
         delta, delta_diff = follow
         pr_text = mode_note + pr_prompt(meta, delta_diff or "(no new commits since the previous review)", inline,
-                                        prior, "Changes since the previous Müsli review")
+                                        prior, "Changes since the previous review")
     else:
         delta = None
         pr_text = mode_note + pr_prompt(meta, diff, inline, prior)
@@ -396,7 +390,9 @@ def main():
     prior_status = [dict(status_by_id.get(i, {"id": i, "status": "still_open"}), title=f["title"])
                     for i, f in prior_by_id.items()]
     allowed = SEVERITIES[:3] if a.mode == "release" else SEVERITIES
-    findings = [f for f in result.get("findings", []) if f.get("severity") in allowed]
+    findings = [f for f in result.get("findings", []) if f.get("severity") in allowed
+                and (f["severity"] in SEVERITIES[:3] or f.get("prior_id")
+                     or (f.get("confidence") or 0) >= MIN_MINOR_CONFIDENCE)]
     for f in findings:
         if f.get("prior_id") in prior_by_id:
             f["title"] = prior_by_id[f["prior_id"]]["title"]
@@ -404,7 +400,7 @@ def main():
     findings += [dict(prior_by_id[p["id"]], prior_id=p["id"], body=p.get("note", ""))
                  for p in prior_status if p["status"] == "still_open" and p["id"] not in listed]
     # Anti-loop rule: a follow-up only adds new findings that are serious and on newly changed lines
-    # (P0 anywhere). From the 4th Müsli review on, only P0/P1 can be new.
+    # (P0 anywhere). From the 4th review on, only P0/P1 can be new.
     suppressed = 0
     if followup:
         new_ok = ("P0", "P1") if rounds >= 3 else ("P0", "P1", "P2")
@@ -418,7 +414,7 @@ def main():
     anchored, unanchored, skipped = [], [], 0
     for f in findings:
         line = f.get("line")
-        if f.get("title") in open_titles:  # already has an open Müsli thread; do not repeat it
+        if f.get("title") in open_titles:  # already has an open bot thread; do not repeat it
             skipped += 1
         elif isinstance(line, int) and line in valid.get(f.get("path"), {}) and len(anchored) < MAX_INLINE:
             anchored.append(f)
@@ -448,7 +444,7 @@ def main():
 
 
 def full_review(a, meta, ctx_path, pr_text):
-    """Five parallel lens reviewers, then one synthesis pass."""
+    """Parallel lens reviewers, then one synthesis pass."""
     with ThreadPoolExecutor(max_workers=max(1, a.parallel)) as pool:
         results = list(pool.map(lambda n: run_lens(a, n, meta["files"], ctx_path, pr_text), LENSES))
     candidates, notes, lens_errors = [], [], []

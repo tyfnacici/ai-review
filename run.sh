@@ -10,4 +10,4 @@ set +a
 export PI_CODING_AGENT_DIR="$HOME/.pi-agent"
 exec python3 -I "$HERE/review.py" --repo "$REPO" --pr "$PR" --workdir "$WORKDIR" \
   --pi "$HOME/pi/pi" --model "${MODEL:-zai/glm-5.3}" --thinking "${THINKING:-high}" \
-  --parallel "${PARALLEL:-5}" --mode "${MODE:-feature}"
+  --parallel "${PARALLEL:-3}" --mode "${MODE:-feature}"

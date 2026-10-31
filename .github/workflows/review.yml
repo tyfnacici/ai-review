@@ -1,6 +1,6 @@
-name: Müsli review
+name: AI review
 
-# Reusable workflow. Callers grant `contents: read` + `pull-requests: write`.
+# Reusable workflow. Callers grant `contents: write` (only to resolve fixed review threads) + `pull-requests: write`.
 on:
   workflow_call:
     inputs:
@@ -14,6 +14,30 @@ on:
         default: staging
 
 jobs:
+  secrets:
+    # Deterministic secret scan of the lines this PR adds; fails the check on a leak (values are redacted).
+    if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, s10-review]
+    timeout-minutes: 5
+    env:
+      GITLEAKS: 8.30.1
+      GITLEAKS_SHA256: e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080
+    steps:
+      - name: Scan added lines with gitleaks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bin="$HOME/bin/gitleaks-$GITLEAKS"
+          if [ ! -x "$bin" ]; then
+            tmp=$(mktemp -d)
+            curl -fsSL -o "$tmp/g.tgz" "https://github.com/gitleaks/gitleaks/releases/download/v$GITLEAKS/gitleaks_${GITLEAKS}_linux_arm64.tar.gz"
+            echo "$GITLEAKS_SHA256  $tmp/g.tgz" | sha256sum -c -
+            tar xzf "$tmp/g.tgz" -C "$tmp" gitleaks
+            mkdir -p "$HOME/bin" && mv "$tmp/gitleaks" "$bin" && rm -rf "$tmp"
+          fi
+          gh pr diff "${{ github.event.pull_request.number }}" -R "${{ github.repository }}" \
+            | { grep '^+' || true; } | "$bin" stdin --redact --no-banner -v
+
   review:
     # Skip drafts and fork PRs (forks get no secrets and must never reach the s10 runner).
     if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
