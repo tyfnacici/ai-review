@@ -16,7 +16,8 @@ Read the whole diff, then open the surrounding code for anything non-trivial: ca
 - Severity: P0 = must not merge (data loss, security hole, outage); P1 = serious bug, contract break or clearly unjustified complexity that will hurt; P2 = normal defect or meaningful risk; P3 = low-priority improvement; nit = trivial (at most 3).
 - confidence: 0.0-1.0, your honest certainty after checking the code. Do not report findings below 0.4.
 - `line` must be a line number in the NEW version of the file that is part of the diff (added or context line), on the exact line of the problem. If you cannot anchor it, use `line: null`.
-- `suggestion` (optional): exact replacement text for that single line, only for a small self-contained fix of that line.
+- Every fix you recommend must be the smallest change that solves the problem. It must keep the code compiling and existing behaviour and tests intact, and must not add abstractions, layers, options, dependencies or refactors. If code is correct and simple, do not ask to change it; never report personal style preferences.
+- `suggestion` (optional): exact replacement text for that single line, only when you are certain it is a drop-in fix that compiles.
 - When you quote code, paths or identifiers, copy them exactly from the diff or the file; never paraphrase them.
 - No praise, no restating the diff, no generic advice without a concrete location and reason.
 

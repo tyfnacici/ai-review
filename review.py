@@ -134,7 +134,18 @@ def previous_review(reviews):
     return None
 
 
-def pr_prompt(meta, diff, inline_comments, prior):
+def delta_since(repo, prior, head):
+    """Added lines per path between the previous Müsli review and head, or None for a fresh review."""
+    if not prior or prior["head"] == head:
+        return {} if prior else None
+    status = gh("api", f"repos/{repo}/compare/{prior['head']}...{head}", "--jq", ".status", check=False)
+    if status.returncode != 0 or status.stdout.strip() != "ahead":
+        return None  # force-push or rebase: anchors are unreliable, review fresh
+    diff = gh("api", "-H", "Accept: application/vnd.github.diff", f"repos/{repo}/compare/{prior['head']}...{head}").stdout
+    return {p: {n for n, added in lines.items() if added} for p, lines in commentable_lines(diff).items()}
+
+
+def pr_prompt(meta, diff, inline_comments, prior, delta):
     convo = [f"- {c['author']['login']}: {c['body']}" for c in meta.get("comments", [])]
     convo += [f"- {r['author']['login']} (review, {r['state']}): {r['body']}"
               for r in meta.get("reviews", []) if r.get("body") and MARKER not in r["body"]]
@@ -154,7 +165,11 @@ def pr_prompt(meta, diff, inline_comments, prior):
         f"Changed files:\n{files}\n\n"
         f"Discussion so far (untrusted):\n{chr(10).join(convo) or '(none)'}\n\n"
         f"Prior Müsli findings:\n{prior_txt}\n\n"
-        f"Diff:\n<<<\n{diff}\n>>>\n"
+        + (f"RE-REVIEW: to avoid endless review loops, new findings are only accepted when they are P0/P1 or "
+           f"sit on lines changed since the previous review. Files changed since then: "
+           f"{', '.join(sorted(delta)) or '(none)'}. Do not raise new P2/P3/nit on code that was already reviewed.\n\n"
+           if delta is not None else "")
+        + f"Diff:\n<<<\n{diff}\n>>>\n"
     )
 
 
@@ -221,7 +236,7 @@ def inline_body(f, is_added_line):
     return body
 
 
-def render(result, findings, unanchored, prior_status, lens_errors, model, elapsed, head_sha):
+def render(result, findings, unanchored, prior_status, lens_errors, suppressed, model, elapsed, head_sha):
     dc = result.get("description_consistency") or {}
     parts = [f"## 🐔 {BOT_NAME}'s thoughts: {verdict_of(findings)}", (result.get("summary") or "").strip()]
     parts.append(f"**Description vs. changes:** {'✅' if dc.get('ok') else '⚠️'} {(dc.get('notes') or '').strip()}")
@@ -242,6 +257,8 @@ def render(result, findings, unanchored, prior_status, lens_errors, model, elaps
         parts.append(f"**Testing:** {result['testing_notes'].strip()}")
     if lens_errors:
         parts.append("⚠️ Incomplete: these lenses failed and were skipped: " + ", ".join(lens_errors))
+    if suppressed:
+        parts.append(f"<sub>{suppressed} new minor finding(s) on previously reviewed code were dropped to avoid review loops.</sub>")
     carried = [{k: f.get(k) for k in ("severity", "title", "path", "line")} for f in findings]
     encoded = base64.b64encode(json.dumps(carried, ensure_ascii=False).encode()).decode()
     lenses_ok = len(LENSES) - len(lens_errors)
@@ -311,7 +328,8 @@ def main():
     raw_reviews = json.loads(gh("api", f"repos/{a.repo}/pulls/{a.pr}/reviews", "--paginate").stdout)
     diff = gh("pr", "diff", str(a.pr), "-R", a.repo).stdout
     prior = previous_review(raw_reviews)
-    pr_text = pr_prompt(meta, diff, inline, prior)
+    delta = delta_since(a.repo, prior, meta["headRefOid"])
+    pr_text = pr_prompt(meta, diff, inline, prior, delta)
     context = base_context(a.repo, meta["baseRefName"])
     ctx_path = write_temp(context) if context else None
 
@@ -348,6 +366,12 @@ def main():
     for f in findings:
         if f.get("prior_id") in prior_by_id:
             f["title"] = prior_by_id[f["prior_id"]]["title"]
+    # Anti-loop rule on re-reviews: only prior findings, P0/P1, or findings on newly changed lines survive.
+    suppressed = 0
+    if delta is not None:
+        kept = [f for f in findings if f.get("prior_id") in prior_by_id or f["severity"] in ("P0", "P1")
+                or f.get("line") in delta.get(f.get("path"), ())]
+        suppressed, findings = len(findings) - len(kept), kept
     findings.sort(key=lambda f: SEVERITIES.index(f["severity"]))
     valid = commentable_lines(diff)
     threads = open_bot_threads(a.repo, a.pr)
@@ -366,14 +390,14 @@ def main():
     review = {
         "commit_id": head,
         "event": "COMMENT",
-        "body": render(result, findings, unanchored, prior_status, lens_errors, a.model, elapsed, head),
+        "body": render(result, findings, unanchored, prior_status, lens_errors, suppressed, a.model, elapsed, head),
         "comments": [{"path": f["path"], "line": f["line"], "side": "RIGHT",
                       "body": inline_body(f, valid[f["path"]][f["line"]])} for f in anchored],
     }
     closed = close_fixed_threads(a.repo, a.pr, prior_status, threads, head, a.dry_run)
     print(json.dumps({"elapsed_s": round(elapsed), "candidates": len(candidates), "findings": len(findings),
                       "inline": len(anchored), "summary_only": len(unanchored), "already_posted": skipped,
-                      "threads_resolved": closed, "lens_errors": lens_errors}))
+                      "suppressed": suppressed, "threads_resolved": closed, "lens_errors": lens_errors}))
     if a.dry_run:
         print(json.dumps(review, ensure_ascii=False, indent=2))
         return

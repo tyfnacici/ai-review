@@ -22,6 +22,11 @@ Reviews run on the self-hosted runner `s10-review` (a phone at home), so every G
 5. On re-runs, earlier findings are listed as fixed / still open / no longer applies / not a defect. Müsli replies
    "✅ Fixed in <sha>" on its own threads for fixed findings and resolves them; open ones stay open and are not re-posted.
 
+6. Anti-loop rule: after the first review, new findings are only posted when they are P0/P1 or sit on lines
+   changed since the previous review. Minor new remarks on already-reviewed code are dropped, so a PR converges
+   instead of collecting fresh nits on every push. Suggested fixes must be minimal, keep the build and tests green,
+   and never add abstractions, dependencies or refactors.
+
 Müsli always writes in English and never approves or blocks in GitHub's review state (always `COMMENT`).
 Cost on the Pro plan: about 180 credits and 4 minutes for a small PR (6 Pi calls).
 
@@ -48,7 +53,7 @@ Cost on the Pro plan: about 180 credits and 4 minutes for a small PR (6 Pi calls
      group: ai-review-${{ github.event.pull_request.number }}
      cancel-in-progress: true
    permissions:
-     contents: read
+     contents: write       # only so Müsli can resolve its own fixed threads (GitHub requires it)
      pull-requests: write
    jobs:
      review:
