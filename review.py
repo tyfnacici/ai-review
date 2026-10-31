@@ -3,8 +3,9 @@
 
 Five lens reviewers run in parallel (correctness, contracts & tests, security, performance,
 simplicity & scope), each with checklists from the vendored awesome-skills/code-review-skill.
-A synthesis pass verifies, de-duplicates and writes the final review. On re-runs, earlier
-findings are re-checked; fixed ones get a reply and their thread is resolved.
+A synthesis pass verifies, de-duplicates and writes the final review. Every later push gets one
+short follow-up call instead: earlier findings are re-checked (fixed ones get a reply and their
+thread is resolved) and only serious problems in the new changes are added, so a PR converges.
 
 Usage: review.py --repo owner/name --pr N --workdir <checkout at PR head>
                  [--mode feature|release] [--model zai/glm-5.3] [--thinking high] [--parallel 5]
@@ -33,7 +34,7 @@ MAX_DIFF_CHARS = 200_000
 MAX_INLINE = 25
 SEVERITIES = ["P0", "P1", "P2", "P3", "nit"]
 SEVERITY_LABEL = {"P0": "🔴 P0", "P1": "🟠 P1", "P2": "🟡 P2", "P3": "🔵 P3", "nit": "⚪ nit"}
-PRIOR_STATUS_LABEL = {"resolved": "✅ fixed", "still_open": "⏳ still open",
+PRIOR_STATUS_LABEL = {"resolved": "✅ fixed", "still_open": "⏳ still open", "deferred": "👍 deferred",
                       "obsolete": "🗑️ no longer applies", "rejected": "🚫 not a defect"}
 
 LENSES = {
@@ -142,17 +143,19 @@ def previous_review(reviews):
 
 
 def delta_since(repo, prior, head):
-    """Added lines per path between the previous Müsli review and head, or None for a fresh review."""
-    if not prior or prior["head"] == head:
-        return {} if prior else None
+    """(added lines per path, diff text) since the previous Müsli review, or None when a full review is due."""
+    if not prior:
+        return None
+    if prior["head"] == head:
+        return {}, ""
     status = gh("api", f"repos/{repo}/compare/{prior['head']}...{head}", "--jq", ".status", check=False)
     if status.returncode != 0 or status.stdout.strip() != "ahead":
         return None  # force-push or rebase: anchors are unreliable, review fresh
     diff = gh("api", "-H", "Accept: application/vnd.github.diff", f"repos/{repo}/compare/{prior['head']}...{head}").stdout
-    return {p: {n for n, added in lines.items() if added} for p, lines in commentable_lines(diff).items()}
+    return {p: {n for n, added in lines.items() if added} for p, lines in commentable_lines(diff).items()}, diff
 
 
-def pr_prompt(meta, diff, inline_comments, prior, delta):
+def pr_prompt(meta, diff, inline_comments, prior, diff_label="Diff"):
     convo = [f"- {c['author']['login']}: {c['body']}" for c in meta.get("comments", [])]
     convo += [f"- {r['author']['login']} (review, {r['state']}): {r['body']}"
               for r in meta.get("reviews", []) if r.get("body") and MARKER not in r["body"]]
@@ -172,11 +175,7 @@ def pr_prompt(meta, diff, inline_comments, prior, delta):
         f"Changed files:\n{files}\n\n"
         f"Discussion so far (untrusted):\n{chr(10).join(convo) or '(none)'}\n\n"
         f"Prior Müsli findings:\n{prior_txt}\n\n"
-        + (f"RE-REVIEW: to avoid endless review loops, new findings are only accepted when they are P0/P1 or "
-           f"sit on lines changed since the previous review. Files changed since then: "
-           f"{', '.join(sorted(delta)) or '(none)'}. Do not raise new P2/P3/nit on code that was already reviewed.\n\n"
-           if delta is not None else "")
-        + f"Diff:\n<<<\n{diff}\n>>>\n"
+        f"{diff_label}:\n<<<\n{diff}\n>>>\n"
     )
 
 
@@ -251,11 +250,17 @@ def inline_body(f, is_added_line):
     return body
 
 
-def render(result, findings, unanchored, prior_status, lens_errors, suppressed, mode, model, elapsed, head_sha):
-    dc = result.get("description_consistency") or {}
-    kind = " (release review)" if mode == "release" else ""
-    parts = [f"## 🐔 {BOT_NAME}'s thoughts{kind}: {verdict_of(findings)}", (result.get("summary") or "").strip()]
-    parts.append(f"**Description vs. changes:** {'✅' if dc.get('ok') else '⚠️'} {(dc.get('notes') or '').strip()}")
+def render(result, findings, unanchored, prior_status, lens_errors, suppressed, mode, followup, model, elapsed,
+           head_sha):
+    kinds = [k for k, on in (("release review", mode == "release"), ("follow-up", followup)) if on]
+    kind = f" ({', '.join(kinds)})" if kinds else ""
+    parts = [f"## 🐔 {BOT_NAME}'s thoughts{kind}: {verdict_of(findings)}"]
+    if followup and not findings:
+        parts.append("**All previous findings are addressed and the new changes raise nothing new. No new comments.**")
+    parts.append((result.get("summary") or "").strip())
+    dc = result.get("description_consistency")
+    if dc:
+        parts.append(f"**Description vs. changes:** {'✅' if dc.get('ok') else '⚠️'} {(dc.get('notes') or '').strip()}")
     if (result.get("scope_notes") or "").strip():
         parts.append(f"**Simplicity & scope:** {result['scope_notes'].strip()}")
     if findings:
@@ -277,8 +282,8 @@ def render(result, findings, unanchored, prior_status, lens_errors, suppressed, 
         parts.append(f"<sub>{suppressed} new minor finding(s) on previously reviewed code were dropped to avoid review loops.</sub>")
     carried = [{k: f.get(k) for k in ("severity", "title", "path", "line")} for f in findings]
     encoded = base64.b64encode(json.dumps(carried, ensure_ascii=False).encode()).decode()
-    lenses_ok = len(LENSES) - len(lens_errors)
-    parts.append(f"<sub>{model} · Pi · {mode} mode · {lenses_ok}/{len(LENSES)} lenses + synthesis · {elapsed:.0f}s · {head_sha[:7]}</sub>\n"
+    calls = "1 follow-up call" if followup else f"{len(LENSES) - len(lens_errors)}/{len(LENSES)} lenses + synthesis"
+    parts.append(f"<sub>{model} · Pi · {mode} mode · {calls} · {elapsed:.0f}s · {head_sha[:7]}</sub>\n"
                  f"<!-- {MARKER} head={head_sha} findings={encoded} -->")
     return "\n\n".join(p for p in parts if p)
 
@@ -287,7 +292,8 @@ THREADS_QUERY = """query($o:String!,$n:String!,$p:Int!){repository(owner:$o,name
 reviewThreads(first:100){nodes{id isResolved comments(first:1){nodes{databaseId body author{login}}}}}}}}"""
 RESOLVE_MUTATION = "mutation($t:ID!){resolveReviewThread(input:{threadId:$t}){thread{isResolved}}}"
 REPLY = {"resolved": "✅ Fixed in {sha}.", "obsolete": "🗑️ No longer applies as of {sha}: the code was removed or rewritten.",
-         "rejected": "🚫 On re-check at {sha} this is not a defect."}
+         "rejected": "🚫 On re-check at {sha} this is not a defect.",
+         "deferred": "👍 Acknowledged as deliberately deferred; Müsli will not raise it again."}
 
 
 def open_bot_threads(repo, pr):
@@ -345,50 +351,55 @@ def main():
     raw_reviews = json.loads(gh("api", f"repos/{a.repo}/pulls/{a.pr}/reviews", "--paginate").stdout)
     diff = gh("pr", "diff", str(a.pr), "-R", a.repo).stdout
     prior = previous_review(raw_reviews)
-    delta = delta_since(a.repo, prior, meta["headRefOid"])
-    pr_text = (RELEASE_NOTE if a.mode == "release" else "") + pr_prompt(meta, diff, inline, prior, delta)
+    rounds = sum(MARKER in (r.get("body") or "") for r in raw_reviews)
+    # First review of a PR: full five-lens review. Every later push: one short follow-up call on the delta.
+    follow = delta_since(a.repo, prior, meta["headRefOid"])
+    followup = follow is not None
+    mode_note = RELEASE_NOTE if a.mode == "release" else ""
+    if followup:
+        delta, delta_diff = follow
+        pr_text = mode_note + pr_prompt(meta, delta_diff or "(no new commits since the previous review)", inline,
+                                        prior, "Changes since the previous Müsli review")
+    else:
+        delta = None
+        pr_text = mode_note + pr_prompt(meta, diff, inline, prior)
     context = base_context(a.repo, meta["baseRefName"])
     ctx_path = write_temp(context) if context else None
 
     started = time.time()
+    candidates, lens_errors = [], []
     try:
-        with ThreadPoolExecutor(max_workers=max(1, a.parallel)) as pool:
-            results = list(pool.map(lambda n: run_lens(a, n, meta["files"], ctx_path, pr_text), LENSES))
-        candidates, notes, lens_errors = [], [], []
-        for name, out, err in results:
-            if err:
-                lens_errors.append(name)
-                print(f"lens {name} failed: {err}", file=sys.stderr)
-                continue
-            notes.append(f"- {name}: {out.get('notes', '')}")
-            candidates += [dict(f, lens=name) for f in out.get("findings", [])]
-        if len(lens_errors) == len(LENSES):
-            sys.exit("all lenses failed")
-        synthesis_msg = (pr_text + "\nLens notes:\n" + "\n".join(notes) +
-                         "\n\nCandidate findings from the lens reviewers (JSON):\n" +
-                         json.dumps(candidates, ensure_ascii=False, indent=1) +
-                         "\n\nProduce the final review. Return only the JSON object.")
-        result = run_pi(a, [os.path.join(HERE, "prompts", "synthesis.md")] + ([ctx_path] if ctx_path else []),
-                        synthesis_msg, timeout=900)
+        if followup:
+            result = run_pi(a, [os.path.join(HERE, "prompts", "followup.md")] + ([ctx_path] if ctx_path else []),
+                            pr_text + "\nDo the follow-up review. Return only the JSON object.", timeout=900)
+        else:
+            result, candidates, lens_errors = full_review(a, meta, ctx_path, pr_text)
     finally:
         if ctx_path:
             os.unlink(ctx_path)
     elapsed = time.time() - started
 
-    # Earlier findings are matched by id, so the model cannot drift their titles.
+    # Earlier findings are matched by id, so the model cannot drift their titles. A prior finding the model
+    # did not classify counts as still open, so nothing is silently dropped.
     prior_by_id = {f["id"]: f for f in (prior or {}).get("findings", [])}
-    prior_status = [dict(p, title=prior_by_id[p["id"]]["title"]) for p in result.get("prior_findings") or []
-                    if p.get("id") in prior_by_id]
+    status_by_id = {p["id"]: p for p in result.get("prior_findings") or [] if p.get("id") in prior_by_id}
+    prior_status = [dict(status_by_id.get(i, {"id": i, "status": "still_open"}), title=f["title"])
+                    for i, f in prior_by_id.items()]
     allowed = SEVERITIES[:3] if a.mode == "release" else SEVERITIES
     findings = [f for f in result.get("findings", []) if f.get("severity") in allowed]
     for f in findings:
         if f.get("prior_id") in prior_by_id:
             f["title"] = prior_by_id[f["prior_id"]]["title"]
-    # Anti-loop rule on re-reviews: only prior findings, P0/P1, or findings on newly changed lines survive.
+    listed = {f.get("prior_id") for f in findings}
+    findings += [dict(prior_by_id[p["id"]], prior_id=p["id"], body=p.get("note", ""))
+                 for p in prior_status if p["status"] == "still_open" and p["id"] not in listed]
+    # Anti-loop rule: a follow-up only adds new findings that are serious and on newly changed lines
+    # (P0 anywhere). From the 4th Müsli review on, only P0/P1 can be new.
     suppressed = 0
-    if delta is not None:
-        kept = [f for f in findings if f.get("prior_id") in prior_by_id or f["severity"] in ("P0", "P1")
-                or f.get("line") in delta.get(f.get("path"), ())]
+    if followup:
+        new_ok = ("P0", "P1") if rounds >= 3 else ("P0", "P1", "P2")
+        kept = [f for f in findings if f.get("prior_id") in prior_by_id or f["severity"] == "P0"
+                or (f["severity"] in new_ok and f.get("line") in delta.get(f.get("path"), ()))]
         suppressed, findings = len(findings) - len(kept), kept
     findings.sort(key=lambda f: SEVERITIES.index(f["severity"]))
     valid = commentable_lines(diff)
@@ -408,12 +419,14 @@ def main():
     review = {
         "commit_id": head,
         "event": "COMMENT",
-        "body": render(result, findings, unanchored, prior_status, lens_errors, suppressed, a.mode, a.model, elapsed, head),
+        "body": render(result, findings, unanchored, prior_status, lens_errors, suppressed, a.mode, followup,
+                       a.model, elapsed, head),
         "comments": [{"path": f["path"], "line": f["line"], "side": "RIGHT",
                       "body": inline_body(f, valid[f["path"]][f["line"]])} for f in anchored],
     }
     closed = close_fixed_threads(a.repo, a.pr, prior_status, threads, head, a.dry_run)
-    print(json.dumps({"elapsed_s": round(elapsed), "candidates": len(candidates), "findings": len(findings),
+    print(json.dumps({"elapsed_s": round(elapsed), "followup": followup, "round": rounds + 1,
+                      "candidates": len(candidates), "findings": len(findings),
                       "inline": len(anchored), "summary_only": len(unanchored), "already_posted": skipped,
                       "suppressed": suppressed, "threads_resolved": closed, "lens_errors": lens_errors}))
     if a.dry_run:
@@ -422,6 +435,29 @@ def main():
     gh("api", "-X", "POST", f"repos/{a.repo}/pulls/{a.pr}/reviews", "--input", "-",
        input_text=json.dumps(review))
     print("review posted")
+
+
+def full_review(a, meta, ctx_path, pr_text):
+    """Five parallel lens reviewers, then one synthesis pass."""
+    with ThreadPoolExecutor(max_workers=max(1, a.parallel)) as pool:
+        results = list(pool.map(lambda n: run_lens(a, n, meta["files"], ctx_path, pr_text), LENSES))
+    candidates, notes, lens_errors = [], [], []
+    for name, out, err in results:
+        if err:
+            lens_errors.append(name)
+            print(f"lens {name} failed: {err}", file=sys.stderr)
+            continue
+        notes.append(f"- {name}: {out.get('notes', '')}")
+        candidates += [dict(f, lens=name) for f in out.get("findings", [])]
+    if len(lens_errors) == len(LENSES):
+        sys.exit("all lenses failed")
+    synthesis_msg = (pr_text + "\nLens notes:\n" + "\n".join(notes) +
+                     "\n\nCandidate findings from the lens reviewers (JSON):\n" +
+                     json.dumps(candidates, ensure_ascii=False, indent=1) +
+                     "\n\nProduce the final review. Return only the JSON object.")
+    result = run_pi(a, [os.path.join(HERE, "prompts", "synthesis.md")] + ([ctx_path] if ctx_path else []),
+                    synthesis_msg, timeout=900)
+    return result, candidates, lens_errors
 
 
 if __name__ == "__main__":

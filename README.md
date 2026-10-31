@@ -19,13 +19,12 @@ Reviews run on the self-hosted runner `s10-review` (a phone at home), so every G
 3. A synthesis pass verifies every candidate against the code, merges duplicates, re-checks earlier findings and writes the final review.
 4. One PR review is posted as `github-actions[bot]`: header `🐔 Müsli's thoughts` with a verdict (only P0/P1 block), inline comments
    (max 25, with `suggestion` blocks for one-line fixes), severity + confidence + lenses per finding, and the model in the footer.
-5. On re-runs, earlier findings are listed as fixed / still open / no longer applies / not a defect. Müsli replies
-   "✅ Fixed in <sha>" on its own threads for fixed findings and resolves them; open ones stay open and are not re-posted.
-
-6. Anti-loop rule: after the first review, new findings are only posted when they are P0/P1 or sit on lines
-   changed since the previous review. Minor new remarks on already-reviewed code are dropped, so a PR converges
-   instead of collecting fresh nits on every push. Suggested fixes must be minimal, keep the build and tests green,
-   and never add abstractions, dependencies or refactors.
+5. **Every later push gets a short follow-up, not a new full review** (one Pi call on the changes since the
+   last review): each earlier finding is re-checked as fixed / still open / deferred / no longer applies / not a defect.
+   Müsli replies "✅ Fixed in <sha>" (or "👍 deferred") on its own threads and resolves them; open ones stay open and are
+   not re-posted. New findings in a follow-up must be P0-P2 on newly changed lines (P0 anywhere); from the 4th review on,
+   only P0/P1. When nothing is left it says "No new comments", so a PR converges instead of looping. Suggested fixes
+   must be minimal, keep the build and tests green, and never add abstractions, dependencies or refactors.
 
 ## Two review modes
 The mode is picked from the PR's head branch (`release_from` input, default `staging`):
@@ -47,6 +46,7 @@ Cost on the Pro plan: about 180 credits and 4 minutes for a small PR (6 Pi calls
 | `review.py` | Orchestration: PR data, parallel lenses, synthesis, posting, thread resolution |
 | `prompts/base.md` | Shared lens reviewer instructions and output contract |
 | `prompts/synthesis.md` | Lead reviewer instructions and final output contract |
+| `prompts/followup.md` | Follow-up review instructions for later pushes |
 | `vendor/code-review-skill/` | Checklists from [awesome-skills/code-review-skill](https://github.com/awesome-skills/code-review-skill) (MIT, pinned commit in `SOURCE.md`) |
 | `run.sh` | Runner entrypoint: loads the GLM key and calls `review.py` |
 | `.github/workflows/review.yml` | Reusable workflow called by projects |
