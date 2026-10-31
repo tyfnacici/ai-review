@@ -3,6 +3,8 @@ name: AI review
 
 on:
   pull_request:
+    # Only feature PRs into main; promotion PRs (main -> staging -> production) carry already-reviewed code.
+    branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
