@@ -1,4 +1,4 @@
-name: AI review
+name: Müsli review
 
 # Reusable workflow. Callers grant `contents: read` + `pull-requests: write`.
 on:

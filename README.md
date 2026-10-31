@@ -1,29 +1,45 @@
-# ai-review
+# ai-review: 🥣 Müsli
 
-Pull request açıldığında GLM Coding Plan (Pi + `zai/glm-5.3`) ile otomatik kod incelemesi.
-İnceleme s10'daki self-hosted runner'da (`s10-review`) çalışır; GLM istekleri ev IP'sinden çıkar.
+Automatic pull request review with the GLM Coding Plan (Pi + `zai/glm-5.3`).
+Reviews run on the self-hosted runner `s10-review` (a phone at home), so every GLM request leaves from the home IP.
 
-## Ne yapar
-- PR başlığı, açıklaması, önceki yorumları ve diff'i okur.
-- Projenin **ana dalındaki** `CLAUDE.md` / `AGENTS.md` (varsa `.github/ai-review.md`) dosyasını proje kuralı olarak kullanır.
-- Doğruluk, güvenlik, kod kalitesi, kapsam dışı değişiklikler ve açıklama–kod tutarlılığına bakar.
-- Sonucu satır bazlı yorumlar + özet olarak tek bir PR review'u halinde yazar (`github-actions[bot]`).
+## What Müsli does
+- Reads the PR title, description, discussion, changed files and diff, and opens surrounding code with read-only tools.
+- Uses the project's **base-branch** `CLAUDE.md` / `AGENTS.md` (plus optional `.github/ai-review.md`) as the project rulebook. A PR cannot change its own review rules.
+- Reviews correctness, contracts/integration, security, performance, tests, scope, and whether the description matches the code.
+- Always writes in English, whatever the PR's language.
+- Posts one PR review as `github-actions[bot]`:
+  - header `🥣 Müsli's thoughts` with a verdict derived from severities (only P0/P1 block),
+  - inline comments on changed lines (max 25), with GitHub `suggestion` blocks for small one-line fixes,
+  - severity (P0-P3, nit) and confidence per finding,
+  - a "Prior findings" section on re-runs: each earlier finding is re-checked as resolved / still open / obsolete / not a defect,
+  - no duplicate inline comments on re-runs,
+  - model, duration and commit in the footer.
+- Never approves or blocks the PR in GitHub's review state (always `COMMENT`).
 
-## Dosyalar
-| Dosya | Görev |
+## Files
+| File | Purpose |
 |---|---|
-| `review.py` | PR verisini `gh` ile toplar, Pi'yi çalıştırır, review'u gönderir |
-| `system.md` | Modelin inceleme talimatı ve JSON çıktı biçimi |
-| `run.sh` | Runner'da GLM anahtarını yükleyip `review.py`'yi çağırır |
-| `.github/workflows/review.yml` | Projelerin çağırdığı ortak (reusable) workflow |
-| `caller-example.yml` | Projeye kopyalanacak workflow |
+| `review.py` | Collects PR data with `gh`, runs Pi, validates anchors, posts the review |
+| `system.md` | Reviewer instructions and JSON output contract |
+| `run.sh` | Runner entrypoint: loads the GLM key and calls `review.py` |
+| `.github/workflows/review.yml` | Reusable workflow called by projects |
+| `caller-example.yml` | Workflow to copy into a project |
 
-## Yeni projeye eklemek
-1. s10'da o repo için bir `s10-review` runner'ı kaydet (`/opt/gha-review/runners/<repo>`).
-2. `caller-example.yml` dosyasını projede `.github/workflows/ai-review.yml` olarak ekle.
-3. Projede güncel bir `CLAUDE.md` olsun.
+## Adding Müsli to a project
+1. Register an `s10-review` runner for that repo on s10 under `/opt/gha-review/runners/<repo>`.
+2. Copy `caller-example.yml` to `<project>/.github/workflows/ai-review.yml`.
+3. Keep the project's `CLAUDE.md` up to date; it is the review rulebook.
 
-## s10 tarafı
-- Kullanıcı `gha-review` (sistem kullanıcısı, docker/sudo yok), home `/opt/gha-review`.
-- GLM anahtarı `/opt/gha-review/.config/glm/zai.env` (600). GitHub'a hiç gitmez.
-- Bu repo `/opt/gha-review/ai-review` altında, salt-okunur deploy key ile her işte güncellenir.
+Only PRs targeting `main` are reviewed. Promotion PRs (`main` → `staging` → `production`) carry code that was already reviewed.
+
+## Settings
+| Variable | Default | Where |
+|---|---|---|
+| `model` input | `zai/glm-5.3` | caller workflow (`with: model: ...`) |
+| `THINKING` | `high` | runner environment |
+
+## s10 side
+- User `gha-review` (system user, no docker/sudo), home `/opt/gha-review`.
+- GLM Coding Plan key in `/opt/gha-review/.config/glm/zai.env` (mode 600). It never goes to GitHub.
+- This repo is cloned at `/opt/gha-review/ai-review` with a read-only deploy key and synced at the start of every job.
