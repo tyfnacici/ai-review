@@ -1,57 +1,60 @@
-# ai-review: 🐔 Müsli
+# ai-review
 
-Automatic pull request review with the GLM Coding Plan (Pi + `zai/glm-5.3`).
-Reviews run on the self-hosted runner `s10-review` (a phone at home), so every GLM request leaves from the home IP.
+Automatic pull request review with the GLM Coding Plan (Pi + `zai/glm-5.3`), plus a deterministic secret scan.
+Everything runs on the self-hosted runner `s10-review` (a phone at home), so every GLM request leaves from the home IP.
 
-## How a review works
+## What runs on a PR
+| Job | What it does | Fails the check? |
+|---|---|---|
+| `secrets` | [gitleaks](https://github.com/gitleaks/gitleaks) scans the lines the PR adds (values redacted in the log) | yes, on a leak |
+| `review` | AI review posted as one PR review by `github-actions[bot]` | no, advisory only |
+
+## How the AI review works
 1. Collect the PR title, description, discussion, changed files and diff with `gh`, plus the project rulebook
    (`CLAUDE.md` / `AGENTS.md` / optional `.github/ai-review.md`) from the **base** branch, so a PR cannot rewrite its own rules.
-2. Five lens reviewers run **in parallel**, each a separate Pi call with read-only tools and its own checklists:
+2. **First review of a PR:** three lens reviewers run in parallel, each a separate Pi call with read-only tools and its own checklists:
 
    | Lens | Looks for | Checklists (`vendor/code-review-skill/reference/`) |
    |---|---|---|
-   | correctness | logic, edge cases, errors, state, concurrency | common bugs, error handling, async/concurrency, language guides for changed file types |
-   | contracts | API/wire/data/migration compatibility, broken callers, tests | review best practices |
-   | security | authn/authz, injection, secrets, abuse paths | security guide, SQL injection, XSS |
-   | performance | complexity, N+1, unbounded growth, leaks | performance guide, N+1 |
-   | simplicity | KISS: out-of-scope changes, over-engineering, too much code, not following project structure, new deps | universal code quality |
+   | correctness | logic, edge cases, errors, concurrency, API/data/migration compatibility, broken or missing tests | common bugs, error handling, async, best practices, language guides for changed file types |
+   | security_performance | authn/authz, injection, secrets, abuse paths; complexity, N+1, leaks | security, SQL injection, XSS, performance, N+1 |
+   | simplicity | KISS: out-of-scope changes, over-engineering, too much code, not following project structure, new deps, needless comments | universal code quality |
 
-3. A synthesis pass verifies every candidate against the code, merges duplicates, re-checks earlier findings and writes the final review.
-4. One PR review is posted as `github-actions[bot]`: header `🐔 Müsli's thoughts` with a verdict (only P0/P1 block), inline comments
-   (max 25, with `suggestion` blocks for one-line fixes), severity + confidence + lenses per finding, and the model in the footer.
-5. **Every later push gets a short follow-up, not a new full review** (one Pi call on the changes since the
-   last review): each earlier finding is re-checked as fixed / still open / deferred / no longer applies / not a defect.
-   Müsli replies "✅ Fixed in <sha>" (or "👍 deferred") on its own threads and resolves them; open ones stay open and are
-   not re-posted. New findings in a follow-up must be P0-P2 on newly changed lines (P0 anywhere); from the 4th review on,
-   only P0/P1. When nothing is left it says "No new comments", so a PR converges instead of looping. Suggested fixes
-   must be minimal, keep the build and tests green, and never add abstractions, dependencies or refactors.
+   A synthesis pass verifies every candidate against the code, merges duplicates and writes the review.
+3. **Every later push:** one short follow-up call on the changes since the last review. Earlier findings are re-checked as
+   fixed / still open / deferred / no longer applies / not a defect; the bot replies "Fixed in <sha>" on its own threads and
+   resolves them. New findings must be P0-P2 on newly changed lines (P0 anywhere); from the 4th review on, only P0/P1.
+   When nothing is left it says "No new comments", so a PR converges instead of looping.
+4. The review has a plain header (`Code review: Changes requested | Worth a look | Looks good`; only P0/P1 count as
+   changes requested), inline comments (max 25, `suggestion` blocks for one-line fixes or deletions), severity, confidence
+   and lenses per finding, and the model in the footer. P3/nit findings below 0.7 confidence are dropped.
+5. Fixes must be minimal, keep the build and tests green, and never add abstractions, dependencies or refactors.
+   Comments added in the diff that restate code, tell history, leak chat/task context or read like notes to an AI are flagged.
+
+It always writes in English and never approves or blocks in GitHub's review state (always `COMMENT`).
+Cost on the Pro plan: about 150 credits and 3-4 minutes for the first review of a small PR, about 10 credits and
+under a minute for a follow-up.
 
 ## Two review modes
 The mode is picked from the PR's head branch (`release_from` input, default `staging`):
 
 | PR | Mode | Focus |
 |---|---|---|
-| feature branch → `main` or `staging` | feature | one change in depth: correctness, KISS, scope, tests |
+| feature branch → `main` or `staging` | feature | one change in depth |
 | `staging` → `main` | release | combined effect of already-reviewed features: interactions, migrations, config, deploy/rollback, client API breaks; P0-P2 only |
-
-Both modes use the same five lenses and the same anti-loop rule. To change which branch counts as a release, set
-`with: release_from: <branch>` in the project's caller workflow.
-
-Müsli always writes in English and never approves or blocks in GitHub's review state (always `COMMENT`).
-Cost on the Pro plan: about 180 credits and 4 minutes for a small PR (6 Pi calls).
 
 ## Files
 | File | Purpose |
 |---|---|
-| `review.py` | Orchestration: PR data, parallel lenses, synthesis, posting, thread resolution |
-| `prompts/base.md` | Shared lens reviewer instructions and output contract |
+| `review.py` | Orchestration: PR data, parallel lenses, synthesis or follow-up, posting, thread resolution |
+| `prompts/base.md` | Lens reviewer instructions and output contract |
 | `prompts/synthesis.md` | Lead reviewer instructions and final output contract |
 | `prompts/followup.md` | Follow-up review instructions for later pushes |
 | `vendor/code-review-skill/` | Checklists from [awesome-skills/code-review-skill](https://github.com/awesome-skills/code-review-skill) (MIT, pinned commit in `SOURCE.md`) |
 | `run.sh` | Runner entrypoint: loads the GLM key and calls `review.py` |
-| `.github/workflows/review.yml` | Reusable workflow called by projects |
+| `.github/workflows/review.yml` | Reusable workflow (`secrets` + `review` jobs) called by projects |
 
-## Adding Müsli to a project
+## Adding it to a project
 1. Register an `s10-review` runner for that repo on s10 under `/opt/gha-review/runners/<repo>`.
 2. Add `<project>/.github/workflows/ai-review.yml`:
    ```yaml
@@ -64,22 +67,24 @@ Cost on the Pro plan: about 180 credits and 4 minutes for a small PR (6 Pi calls
      group: ai-review-${{ github.event.pull_request.number }}
      cancel-in-progress: true
    permissions:
-     contents: write       # only so Müsli can resolve its own fixed threads (GitHub requires it)
+     contents: write       # only so the bot can resolve its own fixed threads (GitHub requires it)
      pull-requests: write
    jobs:
      review:
        uses: tyfnacici/ai-review/.github/workflows/review.yml@main
    ```
 3. Keep the project's `CLAUDE.md` up to date; it is the review rulebook.
+4. Turn on Dependabot alerts for the repo (alerts only; no automatic PRs needed).
 
 ## Settings (runner environment)
 | Variable | Default | Meaning |
 |---|---|---|
 | `model` (workflow input) | `zai/glm-5.3` | Pi model spec |
 | `THINKING` | `high` | Pi thinking level |
-| `PARALLEL` | `5` | Lens calls running at once (lower it if the plan rate-limits) |
+| `PARALLEL` | `3` | Lens calls running at once |
 
 ## s10 side
 - User `gha-review` (system user, no docker/sudo), home `/opt/gha-review`.
 - GLM Coding Plan key in `/opt/gha-review/.config/glm/zai.env` (mode 600). It never goes to GitHub.
 - This repo is cloned at `/opt/gha-review/ai-review` with a read-only deploy key and synced at the start of every job.
+- gitleaks is downloaded once (pinned version, SHA-256 checked) to `/opt/gha-review/bin`.
