@@ -9,5 +9,5 @@ set -a
 set +a
 export PI_CODING_AGENT_DIR="$HOME/.pi-agent"
 exec python3 -I "$HERE/review.py" --repo "$REPO" --pr "$PR" --workdir "$WORKDIR" \
-  --system "$HERE/system.md" --pi "$HOME/pi/pi" --model "${MODEL:-zai/glm-5.3}" \
-  --thinking "${THINKING:-high}"
+  --pi "$HOME/pi/pi" --model "${MODEL:-zai/glm-5.3}" --thinking "${THINKING:-high}" \
+  --parallel "${PARALLEL:-5}"
