@@ -8,6 +8,10 @@ on:
         description: Pi model spec
         type: string
         default: zai/glm-5.3
+      release_from:
+        description: PRs whose head is this branch get a release review (combined effect); all others a feature review
+        type: string
+        default: staging
 
 jobs:
   review:
@@ -32,4 +36,5 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           WORKDIR: ${{ github.workspace }}
           MODEL: ${{ inputs.model }}
+          MODE: ${{ github.head_ref == inputs.release_from && 'release' || 'feature' }}
         run: '"$HOME/ai-review/run.sh"'

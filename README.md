@@ -27,6 +27,17 @@ Reviews run on the self-hosted runner `s10-review` (a phone at home), so every G
    instead of collecting fresh nits on every push. Suggested fixes must be minimal, keep the build and tests green,
    and never add abstractions, dependencies or refactors.
 
+## Two review modes
+The mode is picked from the PR's head branch (`release_from` input, default `staging`):
+
+| PR | Mode | Focus |
+|---|---|---|
+| feature branch → `main` or `staging` | feature | one change in depth: correctness, KISS, scope, tests |
+| `staging` → `main` | release | combined effect of already-reviewed features: interactions, migrations, config, deploy/rollback, client API breaks; P0-P2 only |
+
+Both modes use the same five lenses and the same anti-loop rule. To change which branch counts as a release, set
+`with: release_from: <branch>` in the project's caller workflow.
+
 Müsli always writes in English and never approves or blocks in GitHub's review state (always `COMMENT`).
 Cost on the Pro plan: about 180 credits and 4 minutes for a small PR (6 Pi calls).
 
@@ -47,7 +58,7 @@ Cost on the Pro plan: about 180 credits and 4 minutes for a small PR (6 Pi calls
    name: AI review
    on:
      pull_request:
-       branches: [main]
+       branches: [main, staging]
        types: [opened, synchronize, reopened, ready_for_review]
    concurrency:
      group: ai-review-${{ github.event.pull_request.number }}

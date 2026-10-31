@@ -7,7 +7,9 @@ A synthesis pass verifies, de-duplicates and writes the final review. On re-runs
 findings are re-checked; fixed ones get a reply and their thread is resolved.
 
 Usage: review.py --repo owner/name --pr N --workdir <checkout at PR head>
-                 [--model zai/glm-5.3] [--thinking high] [--parallel 5] [--pi pi] [--dry-run]
+                 [--mode feature|release] [--model zai/glm-5.3] [--thinking high] [--parallel 5]
+                 [--pi pi] [--dry-run]
+Feature mode reviews one change in depth; release mode (e.g. staging -> main) looks at the combined effect.
 Needs: gh (authenticated via GH_TOKEN), pi, ZAI_API_KEY in the environment.
 Project rules come from CLAUDE.md / AGENTS.md / .github/ai-review.md on the BASE branch.
 """
@@ -65,6 +67,11 @@ LENSES = {
         "what the simpler alternative is. Also check whether the description matches what the code does.",
         ["code-quality-universal.md"]),
 }
+RELEASE_NOTE = (
+    "RELEASE REVIEW: this PR promotes features that were already reviewed one by one (e.g. staging -> main). "
+    "Do not re-review individual lines in depth. Look at the combined effect through your lens: interactions "
+    "between the features, migrations and data, config/env changes, deploy and rollback risk, breaking API "
+    "changes for clients (web, mobile), leftover debug code or half-finished work. Report P0-P2 only.\n\n")
 LANGUAGE_GUIDES = {".rs": ["rust.md"], ".ts": ["typescript.md"], ".tsx": ["typescript.md", "react.md"],
                    ".jsx": ["react.md"], ".py": ["python.md"], ".kt": ["kotlin.md"], ".php": ["php.md"],
                    ".vue": ["vue.md"], ".go": ["go.md"], ".java": ["java.md"], ".swift": ["swift.md"],
@@ -190,7 +197,15 @@ def run_pi(a, prompt_files, message, timeout):
     run = subprocess.run(cmd, input=message, cwd=a.workdir, capture_output=True, text=True, timeout=timeout)
     if run.returncode != 0:
         raise RuntimeError(f"pi exited {run.returncode}: {run.stderr.strip()[-500:]}")
-    return extract_json(run.stdout)
+    try:
+        return extract_json(run.stdout)
+    except ValueError:  # usually one unescaped quote; a cheap no-tools pass repairs it
+        fix = subprocess.run([a.pi, "-p", "--no-session", "--offline", "--model", a.model, "--thinking", "off",
+                              "--no-tools", "--no-extensions", "--no-skills", "--no-prompt-templates",
+                              "--no-context-files", "--no-mcp"],
+                             input="Repair this into valid JSON with the same content. Return only the JSON.\n\n"
+                                   + run.stdout, capture_output=True, text=True, timeout=300)
+        return extract_json(fix.stdout)
 
 
 def write_temp(text):
@@ -236,9 +251,10 @@ def inline_body(f, is_added_line):
     return body
 
 
-def render(result, findings, unanchored, prior_status, lens_errors, suppressed, model, elapsed, head_sha):
+def render(result, findings, unanchored, prior_status, lens_errors, suppressed, mode, model, elapsed, head_sha):
     dc = result.get("description_consistency") or {}
-    parts = [f"## 🐔 {BOT_NAME}'s thoughts: {verdict_of(findings)}", (result.get("summary") or "").strip()]
+    kind = " (release review)" if mode == "release" else ""
+    parts = [f"## 🐔 {BOT_NAME}'s thoughts{kind}: {verdict_of(findings)}", (result.get("summary") or "").strip()]
     parts.append(f"**Description vs. changes:** {'✅' if dc.get('ok') else '⚠️'} {(dc.get('notes') or '').strip()}")
     if (result.get("scope_notes") or "").strip():
         parts.append(f"**Simplicity & scope:** {result['scope_notes'].strip()}")
@@ -262,7 +278,7 @@ def render(result, findings, unanchored, prior_status, lens_errors, suppressed, 
     carried = [{k: f.get(k) for k in ("severity", "title", "path", "line")} for f in findings]
     encoded = base64.b64encode(json.dumps(carried, ensure_ascii=False).encode()).decode()
     lenses_ok = len(LENSES) - len(lens_errors)
-    parts.append(f"<sub>{model} · Pi · {lenses_ok}/{len(LENSES)} lenses + synthesis · {elapsed:.0f}s · {head_sha[:7]}</sub>\n"
+    parts.append(f"<sub>{model} · Pi · {mode} mode · {lenses_ok}/{len(LENSES)} lenses + synthesis · {elapsed:.0f}s · {head_sha[:7]}</sub>\n"
                  f"<!-- {MARKER} head={head_sha} findings={encoded} -->")
     return "\n\n".join(p for p in parts if p)
 
@@ -318,6 +334,7 @@ def main():
     ap.add_argument("--model", default="zai/glm-5.3")
     ap.add_argument("--thinking", default="high")
     ap.add_argument("--parallel", type=int, default=len(LENSES))
+    ap.add_argument("--mode", choices=["feature", "release"], default="feature")
     ap.add_argument("--pi", default="pi")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
@@ -329,7 +346,7 @@ def main():
     diff = gh("pr", "diff", str(a.pr), "-R", a.repo).stdout
     prior = previous_review(raw_reviews)
     delta = delta_since(a.repo, prior, meta["headRefOid"])
-    pr_text = pr_prompt(meta, diff, inline, prior, delta)
+    pr_text = (RELEASE_NOTE if a.mode == "release" else "") + pr_prompt(meta, diff, inline, prior, delta)
     context = base_context(a.repo, meta["baseRefName"])
     ctx_path = write_temp(context) if context else None
 
@@ -362,7 +379,8 @@ def main():
     prior_by_id = {f["id"]: f for f in (prior or {}).get("findings", [])}
     prior_status = [dict(p, title=prior_by_id[p["id"]]["title"]) for p in result.get("prior_findings") or []
                     if p.get("id") in prior_by_id]
-    findings = [f for f in result.get("findings", []) if f.get("severity") in SEVERITIES]
+    allowed = SEVERITIES[:3] if a.mode == "release" else SEVERITIES
+    findings = [f for f in result.get("findings", []) if f.get("severity") in allowed]
     for f in findings:
         if f.get("prior_id") in prior_by_id:
             f["title"] = prior_by_id[f["prior_id"]]["title"]
@@ -390,7 +408,7 @@ def main():
     review = {
         "commit_id": head,
         "event": "COMMENT",
-        "body": render(result, findings, unanchored, prior_status, lens_errors, suppressed, a.model, elapsed, head),
+        "body": render(result, findings, unanchored, prior_status, lens_errors, suppressed, a.mode, a.model, elapsed, head),
         "comments": [{"path": f["path"], "line": f["line"], "side": "RIGHT",
                       "body": inline_body(f, valid[f["path"]][f["line"]])} for f in anchored],
     }
