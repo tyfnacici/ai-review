@@ -1,0 +1,35 @@
+name: AI review
+
+# Reusable workflow. Callers grant `contents: read` + `pull-requests: write`.
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: Pi model spec
+        type: string
+        default: zai/glm-5.3
+
+jobs:
+  review:
+    # Skip drafts and fork PRs (forks get no secrets and must never reach the s10 runner).
+    if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, s10-review]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Sync reviewer
+        run: git -C "$HOME/ai-review" fetch -q origin main && git -C "$HOME/ai-review" reset -q --hard origin/main
+
+      - name: Review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          WORKDIR: ${{ github.workspace }}
+          MODEL: ${{ inputs.model }}
+        run: '"$HOME/ai-review/run.sh"'

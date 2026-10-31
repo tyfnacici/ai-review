@@ -1,0 +1,18 @@
+# Copy to <project>/.github/workflows/ai-review.yml
+name: AI review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    uses: tyfnacici/ai-review/.github/workflows/review.yml@main
