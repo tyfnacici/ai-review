@@ -7,7 +7,8 @@ A synthesis pass verifies, de-duplicates and writes the final review. Every late
 short follow-up call instead: earlier findings are re-checked (fixed ones get a reply and their
 thread is resolved) and only serious problems in the new changes are added, so a PR converges.
 The diff comes from the local checkout, so PRs of any size work; a large diff is split into batches
-and every lens (or follow-up call) reviews every batch.
+and every lens (or follow-up call) reviews every batch in one wave of parallel calls. A PR too large for one wave
+gets a broad review instead: code and tests only, each file's diff cut to a fair share, P0-P2 only.
 
 Usage: review.py --repo owner/name --pr N --workdir <checkout at PR head>
                  [--mode feature|release] [--model zai/glm-5.3] [--thinking high] [--parallel 3]
@@ -38,9 +39,19 @@ DATA_CHARS = 30_000  # a data file's diff is cut here; code diffs are never cut,
 LOCKFILES = {"package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "Cargo.lock", "Gemfile.lock",
              "poetry.lock", "uv.lock", "composer.lock", "go.sum"}
 DATA_EXTS = {".json", ".csv", ".tsv", ".xml", ".svg", ".txt", ".geojson"}
+DOC_EXTS = {".md", ".mdx", ".rst", ".css", ".scss", ".less"}
 BULK_MIN, BULK_SAMPLE = 10, 2  # a folder with >= 10 changed data files of one type: 2 go in the diff, the rest are listed
 MAX_INLINE = 25
 LENS_TIMEOUT = 1200  # seconds per Pi call
+BROAD_MIN_SHARE = 3000  # below this share per file, a broad review shows outlines instead of cut diffs
+BROAD_NOTE = (
+    "LARGE PR, BROAD REVIEW: this PR is too large to read line by line in the time available. The diff below "
+    "has code and tests only, each file's diff is cut short or shown as an outline (its top-level added lines), "
+    "and the other files are only listed. Look at the "
+    "change broadly through your lens: architecture and layering, contracts between the changed parts (API, "
+    "data, schema, migrations), security-sensitive paths, error-handling patterns, risky dependencies and "
+    "config. Open the files that look riskiest with read/grep. Skip local style and minor issues; report "
+    "P0-P2 only.\n\n")
 SEVERITIES = ["P0", "P1", "P2", "P3", "nit"]
 PRIOR_STATUS_LABEL = {"resolved": "fixed", "still_open": "still open", "deferred": "deferred",
                       "obsolete": "no longer applies", "rejected": "not a defect"}
@@ -96,8 +107,8 @@ def log(msg):
 
 
 def tracked(total):
-    """Wraps a call so each start and finish is logged with how many are done and an estimate of the time left."""
-    done, t0 = itertools.count(1), time.time()
+    """Wraps a call so each start and finish is logged with how many are done."""
+    done = itertools.count(1)
 
     def run(where, fn):
         log(f"{where}: started")
@@ -107,10 +118,7 @@ def tracked(total):
             ok = not (isinstance(out, tuple) and out[2])  # run_lens reports its error instead of raising
             return out
         finally:
-            k = next(done)
-            left = (time.time() - t0) / k * (total - k)
-            log(f"{where}: {'done' if ok else 'failed'} in {time.time() - start:.0f}s ({k}/{total}"
-                + (f", about {left / 60:.0f} min left)" if k < total else ")"))
+            log(f"{where}: {'done' if ok else 'failed'} in {time.time() - start:.0f}s ({next(done)}/{total})")
     return run
 
 
@@ -153,13 +161,25 @@ def split_files(diff):
     return out
 
 
-def plan_batches(file_diffs, limit):
-    """Pack file diffs into batches of about `limit` characters. Returns (batches, skipped, sampled): lockfiles,
-    binaries and minified files are skipped; in a folder with many changed data files only a sample goes in."""
+def priority(path):
+    """Review order: code, then tests, then docs and styles, then data."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in DATA_EXTS:
+        return 3
+    if ext in DOC_EXTS:
+        return 2
+    return 1 if re.search(r"(^|/)(tests?|__tests__|spec)/|[._](test|spec)\.", path) else 0
+
+
+def plan_batches(file_diffs, limit, max_batches=0):
+    """Pack file diffs into batches of about `limit` characters, most important files first. Returns (batches,
+    skipped, listed): lockfiles, binaries and minified files are skipped; in a folder with many changed data files
+    only a sample goes in and the rest are listed. With max_batches (broad review of a large PR) only code and
+    tests go in, each cut to a fair share of the space; the other files are listed."""
     kind = lambda p: (os.path.dirname(p), os.path.splitext(p)[1].lower())
     bulk = Counter(kind(p) for p, _ in file_diffs if kind(p)[1] in DATA_EXTS)
-    seen, batches, size, skipped, sampled = Counter(), [[]], 0, [], []
-    for path, text in file_diffs:
+    seen, kept, skipped, listed = Counter(), [], [], []
+    for path, text in sorted(file_diffs, key=lambda d: priority(d[0])):
         if (os.path.basename(path) in LOCKFILES or path.endswith((".min.js", ".min.css", ".map"))
                 or re.search(r"(?m)^Binary files ", text)):
             skipped.append(path)
@@ -167,17 +187,62 @@ def plan_batches(file_diffs, limit):
         if bulk[kind(path)] >= BULK_MIN:
             seen[kind(path)] += 1
             if seen[kind(path)] > BULK_SAMPLE:
-                sampled.append(path)
+                listed.append(path)
                 continue
+        if max_batches and priority(path) >= 2:
+            listed.append(path)
+            continue
         if kind(path)[1] in DATA_EXTS and len(text) > DATA_CHARS:
             text = text[:DATA_CHARS] + f"\n[diff of {path} cut at {DATA_CHARS} characters; read the file for the rest]\n"
+        kept.append((path, text))
+    if max_batches:
+        kept = shrink(kept, max_batches * limit * 9 // 10)
+    batches, size = [[]], 0
+    for path, text in kept:
         for part in split_large(text, limit):
             if batches[-1] and size + len(part) > limit:
+                if len(batches) == max_batches:
+                    listed.append(path)
+                    break
                 batches.append([])
                 size = 0
             batches[-1].append((path, part))
             size += len(part)
-    return [b for b in batches if b], skipped, sampled
+    return [b for b in batches if b], skipped, listed
+
+
+def shrink(file_diffs, space):
+    """Fit file diffs into about `space` characters for a broad review: each keeps a fair share of its diff, or of
+    its outline when that share would be too small to be useful."""
+    space -= 150 * len(file_diffs)  # the notes added below
+    cap = fair_share([len(t) for _, t in file_diffs], space)
+    if cap >= BROAD_MIN_SHARE:
+        return [(p, t if len(t) <= cap else
+                 f"{t[:cap]}\n[diff of {p} cut at {cap} characters for a broad review; read the file for the rest]\n")
+                for p, t in file_diffs]
+    outlines = [(p, outline(t)) for p, t in file_diffs]
+    cap = fair_share([len(t) for _, t in outlines], space)
+    return [(p, f"{t[:cap]}\n[outline of {p}'s diff: top-level added lines only"
+             f"{f', cut at {cap} characters' if len(t) > cap else ''}; read the file for the rest]\n")
+            for p, t in outlines]
+
+
+def outline(diff):
+    """A file diff reduced to its headers and the added lines that are not indented: declarations, exports, routes."""
+    keep = [l for l in diff.splitlines() if l.startswith(("diff ", "--- ", "+++ ", "@@"))
+            or (l.startswith("+") and l[1:2].strip() and l[1:].strip() not in ("}", "};", "})", "});", ")", "]", "];"))]
+    return "\n".join(keep) + "\n"
+
+
+def fair_share(sizes, space):
+    """Largest per-file cap c with sum(min(size, c)) <= space."""
+    rest = len(sizes)
+    for size in sorted(sizes):
+        if size * rest > space:
+            return space // rest
+        space -= size
+        rest -= 1
+    return max(sizes, default=0)
 
 
 def split_large(text, limit):
@@ -264,8 +329,7 @@ def batch_note(batches, i, skipped, sampled):
                      f"This is batch {i + 1} of {len(batches)}: review the files in the diff below; the full "
                      "file list is context.")
     if sampled:
-        notes.append("Data files of the same kind as ones shown in the diff, left out to save space (read any "
-                     "that matter): " + ", ".join(sampled))
+        notes.append("Files left out of the diff to save space (read any that matter): " + ", ".join(sampled))
     if skipped:
         notes.append("Lockfiles, binaries and minified files, not reviewed: " + ", ".join(skipped))
     return "\n\n".join(notes)
@@ -367,8 +431,9 @@ def inline_body(f, is_added_line):
 
 
 def render(result, findings, unanchored, prior_status, lens_errors, suppressed, mode, followup, model, elapsed,
-           head_sha, calls, skipped, sampled):
-    kinds = [k for k, on in (("release review", mode == "release"), ("follow-up", followup)) if on]
+           head_sha, calls, skipped, sampled, broad):
+    kinds = [k for k, on in (("release review", mode == "release"), ("broad review of a large PR", broad),
+                             ("follow-up", followup)) if on]
     kind = f" ({', '.join(kinds)})" if kinds else ""
     parts = [f"## Code review{kind}: {verdict_of(findings)}"]
     if followup and not findings:
@@ -398,7 +463,7 @@ def render(result, findings, unanchored, prior_status, lens_errors, suppressed, 
         parts.append("**Incomplete:** these review calls failed and their part was skipped: " + ", ".join(lens_errors))
     if skipped or sampled:
         parts.append(f"<sub>Not reviewed line by line: {len(skipped)} lockfile/binary/minified file(s), "
-                     f"{len(sampled)} data file(s) of the same kind as reviewed samples.</sub>")
+                     f"{len(sampled)} file(s) only listed for the reviewers to open as needed.</sub>")
     if suppressed:
         parts.append(f"<sub>{suppressed} new minor finding(s) on previously reviewed code were dropped to avoid review loops.</sub>")
     carried = [{k: f.get(k) for k in ("severity", "title", "path", "line")} for f in findings]
@@ -481,10 +546,17 @@ def main():
     follow = delta_since(a.workdir, prior, head)
     followup = follow is not None
     delta, review_diff = follow if followup else (None, diff)
-    batches, skipped, sampled = plan_batches(split_files(review_diff), a.batch_chars)
-    log(f"{'follow-up' if followup else 'full'} {a.mode} review: {len(batches)} batch(es) of the diff, "
-        f"{len(skipped)} skipped and {len(sampled)} sampled file(s), {a.model}, {a.parallel} call(s) at a time")
-    mode_note = RELEASE_NOTE if a.mode == "release" else ""
+    # A PR whose batches do not fit in one wave of parallel calls gets one broad pass instead of a detailed one.
+    file_diffs = split_files(review_diff)
+    wave = max(1, a.parallel // (1 if followup else len(LENSES)))
+    batches, skipped, sampled = plan_batches(file_diffs, a.batch_chars)
+    broad = len(batches) > wave
+    if broad:
+        batches, skipped, sampled = plan_batches(file_diffs, a.batch_chars, wave)
+    log(f"{'follow-up' if followup else 'full'} {a.mode} review{' (broad)' if broad else ''}: {len(batches)} "
+        f"batch(es) of the diff, {len(skipped)} skipped and {len(sampled)} listed file(s), {a.model}, "
+        f"{a.parallel} call(s) at a time")
+    mode_note = (RELEASE_NOTE if a.mode == "release" else "") + (BROAD_NOTE if broad else "")
     label = "Changes since the previous review" if followup else "Diff"
 
     def batch_text(i, prior_part=prior):
@@ -523,7 +595,7 @@ def main():
     status_by_id = {p["id"]: p for p in result.get("prior_findings") or [] if p.get("id") in prior_by_id}
     prior_status = [dict(status_by_id.get(i, {"id": i, "status": "still_open"}), title=f["title"])
                     for i, f in prior_by_id.items()]
-    allowed = SEVERITIES[:3] if a.mode == "release" else SEVERITIES
+    allowed = SEVERITIES[:3] if a.mode == "release" or broad else SEVERITIES
     findings = [f for f in result.get("findings", []) if f.get("severity") in allowed
                 and (f["severity"] in SEVERITIES[:3] or f.get("prior_id")
                      or (f.get("confidence") or 0) >= MIN_MINOR_CONFIDENCE)]
@@ -559,7 +631,7 @@ def main():
         "commit_id": head,
         "event": "COMMENT",
         "body": render(result, findings, unanchored, prior_status, lens_errors, suppressed, a.mode, followup,
-                       a.model, elapsed, head, calls, skipped, sampled),
+                       a.model, elapsed, head, calls, skipped, sampled, broad),
         "comments": [{"path": f["path"], "line": f["line"], "side": "RIGHT",
                       "body": inline_body(f, valid[f["path"]][f["line"]])} for f in anchored],
     }

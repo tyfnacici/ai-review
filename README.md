@@ -42,18 +42,25 @@ review runs and removes the label, so you can add it again later.
 It always writes in English and never approves or blocks in GitHub's review state (always `COMMENT`).
 Cost on the GLM Coding Plan Pro: about 150 credits and 3-4 minutes for the first review of a small PR, about 10
 credits and under a minute for a follow-up. The job log shows each review call as it starts and finishes, with how many
-are done and an estimate of the time left.
+are done.
 
 ## Large PRs
-Every changed file is reviewed. When the diff is larger than about 120k characters it is split into batches by file
-(a single huge file diff is split into parts), and every lens reviews every batch; the synthesis pass then sees all
-candidates. Follow-ups are batched the same way. Exceptions, listed in the review footer: lockfiles, binaries and
-minified files are skipped; data files (`.json`, `.csv`, `.svg`, ...) are cut at 30k characters, and when one folder
-has 10 or more changed data files of one type only 2 go into the diff and the rest are listed for the reviewer to read.
-A PR with a 450k-character diff takes 4 batches (12 lens calls); one with 400+ files and 4.6M characters, mostly
-data, about 19 batches (57 calls) and can run for a few hours with 3 calls in parallel. Nearly all of that time is
-spent waiting for the model; `parallel` and `batch_chars` are the settings that change it. One runner reviews one PR
-at a time, so other PRs wait in the queue meanwhile; register a second runner on the machine to review two at once.
+A review runs all its model calls in one wave, so it takes about as long as one call plus the synthesis (around
+5-15 minutes), whatever the PR size. The diff is split into batches of about 120k characters (`batch_chars`), code
+first, then tests, docs and styles, then data. Lockfiles, binaries and minified files are skipped; data files are cut
+at 30k characters, and when one folder has 10 or more changed data files of one type only 2 go into the diff and the
+rest are listed for the reviewers to open.
+
+- **Detailed review:** when every batch fits in one wave (`parallel` / 3 batches for the lenses, `parallel` for a
+  follow-up), every lens reviews every batch. With the default `parallel: 3` that is a diff up to about 120k characters.
+- **Broad review of a large PR:** otherwise the reviewers get code and tests only, in the same number of batches. Each
+  file keeps a fair share of its diff; when that share would be too small, every file is shown as an outline (its
+  top-level added lines: declarations, exports, routes). Docs, styles and data are listed. The reviewers look at
+  architecture, contracts, migrations, security-sensitive paths and error handling, open the riskiest files
+  themselves, and report P0-P2 only. A 437-file PR with 4.6M characters of diff becomes 3 lens calls instead of 57.
+
+Raising `parallel` (if your provider's rate limit allows) makes more PRs fit a detailed review. One runner reviews one
+PR at a time, so other PRs wait in the queue meanwhile; register a second runner on the machine to review two at once.
 
 ## Two review modes
 The mode is picked from the PR's head branch (`release_from` input, default `staging`):
@@ -133,7 +140,7 @@ checked version on purpose.
 | `runs_on` | `["self-hosted", "s10-review"]` | Runner labels (JSON list) |
 | `model` | `zai/glm-5.3` | Pi model spec (`provider/model`) |
 | `thinking` | `high` | Pi thinking level (`off` ... `max`); lower is faster |
-| `parallel` | `3` | Review calls running at once; raise it if your provider's rate limit allows |
+| `parallel` | `3` | Review calls running at once; a PR whose batches need more than one wave gets a broad review |
 | `batch_chars` | `120000` | Diff characters per review call; larger diffs are split into batches |
 | `release_from` | `staging` | Head branch that gets a release review |
 | `trigger_label` | `ai-review` | Label that runs the review again |
