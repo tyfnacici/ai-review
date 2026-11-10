@@ -7,7 +7,7 @@ on:
       runs_on:
         description: Runner labels as a JSON list
         type: string
-        default: '["self-hosted", "s10-review"]'
+        default: '["self-hosted", "ai-review"]'
       model:
         description: Pi model spec (provider/model)
         type: string
