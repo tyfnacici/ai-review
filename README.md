@@ -1,7 +1,7 @@
 # ai-review
 
 Automatic pull request review with the [Pi](https://github.com/badlogic/pi-mono) coding agent and any model Pi
-supports (default `zai/glm-5.3` on the GLM Coding Plan), plus a deterministic secret scan.
+supports (default `zai/glm-5.3-flash` on the GLM Coding Plan), plus a deterministic secret scan.
 It runs on a self-hosted GitHub Actions runner on any Linux machine (x64 or arm64), so the model API key stays on that
 machine and every model request leaves from its IP.
 
@@ -60,7 +60,9 @@ rest are listed for the reviewers to open.
   themselves, and report P0-P2 only. A 437-file PR with 4.6M characters of diff becomes 3 lens calls instead of 57.
 
 Raising `parallel` (if your provider's rate limit allows) makes more PRs fit a detailed review. One runner reviews one
-PR at a time, so other PRs wait in the queue meanwhile; register a second runner on the machine to review two at once.
+PR at a time; to review several PRs at once, install more runners on the machine with the same label
+(`RUNNER_NAME=<host>-<repo>-2 ./install.sh <owner>/<repo>`). Each running review makes up to `parallel` model calls
+at once, so 3 runners with `parallel: 3` make up to 9.
 
 ## Two review modes
 The mode is picked from the PR's head branch (`release_from` input, default `staging`):
@@ -128,7 +130,7 @@ checked version on purpose.
        uses: tyfnacici/ai-review/.github/workflows/review.yml@main
        with:
          runs_on: '["self-hosted", "ai-review"]'
-         model: zai/glm-5.3
+         model: zai/glm-5.3-flash
    ```
 3. Create the label once: `gh label create ai-review -R <owner>/<repo> --description "Run the AI review again"`.
 4. Keep the project's `CLAUDE.md` up to date; it is the review rulebook.
@@ -138,7 +140,7 @@ checked version on purpose.
 | Input | Default | Meaning |
 |---|---|---|
 | `runs_on` | `["self-hosted", "s10-review"]` | Runner labels (JSON list) |
-| `model` | `zai/glm-5.3` | Pi model spec (`provider/model`) |
+| `model` | `zai/glm-5.3-flash` | Pi model spec (`provider/model`); `pi --list-models` lists them, e.g. `zai/glm-5.3` for deeper and slower reviews |
 | `thinking` | `high` | Pi thinking level (`off` ... `max`); lower is faster |
 | `parallel` | `3` | Review calls running at once; a PR whose batches need more than one wave gets a broad review |
 | `batch_chars` | `120000` | Diff characters per review call; larger diffs are split into batches |

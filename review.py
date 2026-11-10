@@ -11,7 +11,7 @@ and every lens (or follow-up call) reviews every batch in one wave of parallel c
 gets a broad review instead: code and tests only, each file's diff cut to a fair share, P0-P2 only.
 
 Usage: review.py --repo owner/name --pr N --workdir <checkout at PR head>
-                 [--mode feature|release] [--model zai/glm-5.3] [--thinking high] [--parallel 3]
+                 [--mode feature|release] [--model zai/glm-5.3-flash] [--thinking high] [--parallel 3]
                  [--batch-chars 120000] [--pi pi] [--dry-run]
 Feature mode reviews one change in depth; release mode (e.g. staging -> main) looks at the combined effect.
 Needs: gh (authenticated via GH_TOKEN), pi, and the model provider's API key in the environment (e.g. ZAI_API_KEY).
@@ -522,7 +522,7 @@ def main():
     ap.add_argument("--repo", required=True)
     ap.add_argument("--pr", required=True, type=int)
     ap.add_argument("--workdir", required=True)
-    ap.add_argument("--model", default="zai/glm-5.3")
+    ap.add_argument("--model", default="zai/glm-5.3-flash")
     ap.add_argument("--thinking", default="high")
     ap.add_argument("--parallel", type=int, default=len(LENSES))
     ap.add_argument("--batch-chars", type=int, default=120_000)

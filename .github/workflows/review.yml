@@ -11,7 +11,7 @@ on:
       model:
         description: Pi model spec (provider/model)
         type: string
-        default: zai/glm-5.3
+        default: zai/glm-5.3-flash
       thinking:
         description: Pi thinking level
         type: string
@@ -86,11 +86,12 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Sync reviewer
-        run: git -C "$HOME/ai-review" fetch -q origin main && git -C "$HOME/ai-review" reset -q --hard origin/main
-
-      - name: Update Pi
-        run: '"$HOME/ai-review/update-pi.sh" || echo "::warning::Pi update failed; using the installed version"'
+      - name: Sync reviewer and Pi
+        # Several runners on one machine share the reviewer clone and Pi, so only one job updates them at a time.
+        run: |
+          exec 9>"$HOME/.ai-review.lock" && flock 9
+          git -C "$HOME/ai-review" fetch -q origin main && git -C "$HOME/ai-review" reset -q --hard origin/main
+          "$HOME/ai-review/update-pi.sh" || echo "::warning::Pi update failed; using the installed version"
 
       - name: Review
         env:

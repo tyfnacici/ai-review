@@ -4,15 +4,16 @@
 #   ./install.sh owner/repo            # runner for one repository
 #   ./install.sh my-org                # runner for every repository of an organization
 # Environment overrides: LABEL, RUNNER_NAME, KEY_FILE, AI_REVIEW_URL, RUNNER_USER, RUNNER_HOME.
+# Each runner reviews one PR at a time; run it again with another RUNNER_NAME to review more PRs at once.
 set -euo pipefail
 
 TARGET=${1:?usage: install.sh owner/repo | org}
 LABEL=${LABEL:-ai-review}
-RUNNER_NAME=${RUNNER_NAME:-$(hostname)-ai-review}
+RUNNER_NAME=${RUNNER_NAME:-$(hostname)-${TARGET##*/}}
 AI_REVIEW_URL=${AI_REVIEW_URL:-https://github.com/tyfnacici/ai-review.git}
 U=${RUNNER_USER:-ai-review}
 H=${RUNNER_HOME:-/opt/ai-review}
-RDIR=$H/runners/${TARGET//\//-}
+RDIR=$H/runners/$RUNNER_NAME
 
 case $(uname -m) in
   x86_64) ARCH=x64 ;;
