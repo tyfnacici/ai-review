@@ -77,8 +77,8 @@ jobs:
       && (contains(fromJSON('["opened", "reopened", "ready_for_review"]'), github.event.action)
           || (github.event.action == 'labeled' && github.event.label.name == inputs.trigger_label))
     runs-on: ${{ fromJSON(inputs.runs_on) }}
-    # Large PRs are reviewed in batches (3 lens calls per batch_chars of diff), so they can take hours.
-    timeout-minutes: 360
+    # All model calls run in one wave (a large PR gets a broad review), so a review takes minutes, not hours.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
