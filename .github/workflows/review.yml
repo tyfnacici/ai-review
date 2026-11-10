@@ -63,11 +63,11 @@ jobs:
               x86_64) arch=x64 sha=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb ;;
               *) echo "unsupported architecture: $(uname -m)"; exit 1 ;;
             esac
-            tmp=$(mktemp -d)
+            mkdir -p "$HOME/bin" && tmp=$(mktemp -d "$HOME/bin/.tmp.XXXXXX")
             curl -fsSL -o "$tmp/g.tgz" "https://github.com/gitleaks/gitleaks/releases/download/v$GITLEAKS/gitleaks_${GITLEAKS}_linux_$arch.tar.gz"
             echo "$sha  $tmp/g.tgz" | sha256sum -c -
             tar xzf "$tmp/g.tgz" -C "$tmp" gitleaks
-            mkdir -p "$HOME/bin" && mv "$tmp/gitleaks" "$bin" && rm -rf "$tmp"
+            mv "$tmp/gitleaks" "$bin" && rm -rf "$tmp"
           fi
           # Local diff: GitHub's diff API refuses PRs with more than 300 files.
           git diff "origin/${{ github.base_ref }}...HEAD" \
@@ -99,10 +99,10 @@ jobs:
               x86_64) arch=amd64 sha=160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b ;;
               *) echo "unsupported architecture: $(uname -m)"; exit 1 ;;
             esac
-            tmp=$(mktemp -d)
+            mkdir -p "$HOME/bin" && tmp=$(mktemp -d "$HOME/bin/.tmp.XXXXXX")
             curl -fsSL -o "$tmp/osv" "https://github.com/google/osv-scanner/releases/download/v$OSV_SCANNER/osv-scanner_linux_$arch"
             echo "$sha  $tmp/osv" | sha256sum -c -
-            chmod +x "$tmp/osv" && mkdir -p "$HOME/bin" && mv "$tmp/osv" "$bin" && rm -rf "$tmp"
+            chmod +x "$tmp/osv" && mv "$tmp/osv" "$bin" && rm -rf "$tmp"
           fi
 
       - name: Sync reviewer
