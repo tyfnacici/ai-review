@@ -603,7 +603,14 @@ def main():
     ap.add_argument("--mode", choices=["feature", "release"], default="feature")
     ap.add_argument("--pi", default="pi")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--gate", action="store_true", help="only report the bot's unresolved threads; exit 1 if any")
     a = ap.parse_args()
+    if a.gate:
+        open_threads = open_bot_threads(a.repo, a.pr)
+        print(f"{len(open_threads)} unresolved AI review thread(s)")
+        for t in open_threads:
+            print(f"- {t['title']}")
+        sys.exit(1 if open_threads else 0)
     budget = a.time_budget * 60 or float("inf")
     a.until = time.time() + budget - 30  # leaves time to post the review
     a.errors, a.cut_short = [], False
@@ -708,6 +715,10 @@ def main():
                       "body": inline_body(f, valid[f["path"]][f["line"]])} for f in anchored],
     }
     closed = close_fixed_threads(a.repo, a.pr, prior_status, threads, head, a.dry_run)
+    # The bot approves only when nothing is left: no finding and no unresolved thread of its own.
+    approve = not findings and not threads and not a.errors and not a.cut_short
+    if approve:
+        review["event"] = "APPROVE"
     print(json.dumps({"elapsed_s": round(elapsed), "followup": followup, "round": rounds + 1,
                       "findings": len(findings),
                       "inline": len(anchored), "summary_only": len(unanchored), "already_posted": repeated,
@@ -716,9 +727,13 @@ def main():
     if a.dry_run:
         print(json.dumps(review, ensure_ascii=False, indent=2))
         return
-    gh("api", "-X", "POST", f"repos/{a.repo}/pulls/{a.pr}/reviews", "--input", "-",
-       input_text=json.dumps(review))
-    print("review posted")
+    posted = gh("api", "-X", "POST", f"repos/{a.repo}/pulls/{a.pr}/reviews", "--input", "-",
+                input_text=json.dumps(review), check=not approve)
+    if posted.returncode != 0:
+        log(f"could not approve ({posted.stderr.strip()[:200]}); posting a comment instead")
+        review["event"] = "COMMENT"
+        gh("api", "-X", "POST", f"repos/{a.repo}/pulls/{a.pr}/reviews", "--input", "-", input_text=json.dumps(review))
+    print(f"review posted ({review['event'].lower()})")
 
 
 def full_review(a, batches, ctx_path, pr_text):
