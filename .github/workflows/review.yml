@@ -15,11 +15,11 @@ on:
       thinking:
         description: Pi thinking level
         type: string
-        default: high
+        default: medium
       parallel:
-        description: Review calls running at once
+        description: Follow-up calls at once for a large follow-up; keep 1 on plans with low concurrency
         type: number
-        default: 3
+        default: 1
       batch_chars:
         description: Diff characters per review call; larger diffs are split into batches
         type: number
@@ -81,7 +81,7 @@ jobs:
       && (contains(fromJSON('["opened", "reopened", "ready_for_review"]'), github.event.action)
           || (github.event.action == 'labeled' && github.event.label.name == inputs.trigger_label))
     runs-on: ${{ fromJSON(inputs.runs_on) }}
-    # All model calls run in one wave (a large PR gets a broad review) within time_budget.
+    # One agent run per review (a large PR gets a broad review) within time_budget, plus waiting for the model lock.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

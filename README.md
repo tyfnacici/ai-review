@@ -18,15 +18,17 @@ review runs and removes the label, so you can add it again later.
 1. Collect the PR title and discussion with `gh` and the diff with `git` from the checkout (GitHub's diff API stops
    at 300 files, so PRs of any size work), plus the project rulebook
    (`CLAUDE.md` / `AGENTS.md` / optional `.github/ai-review.md`) from the **base** branch, so a PR cannot rewrite its own rules.
-2. **First review of a PR:** three lens reviewers run in parallel, each a separate Pi call with read-only tools and its own checklists:
+2. **First review of a PR:** one Pi agent with read-only tools reviews the PR from three perspectives, verifies its
+   own findings against the code and writes the review. It reads the vendored checklists only when one helps it decide:
 
-   | Lens | Looks for | Checklists (`vendor/code-review-skill/reference/`) |
+   | Perspective | Looks for | Checklists (`vendor/code-review-skill/reference/`) |
    |---|---|---|
    | correctness | logic, edge cases, errors, concurrency, API/data/migration compatibility, broken or missing tests | common bugs, error handling, async, best practices, language guides for changed file types |
    | security_performance | authn/authz, injection, secrets, abuse paths; complexity, N+1, leaks | security, SQL injection, XSS, performance, N+1 |
    | simplicity | KISS: out-of-scope changes, over-engineering, too much code, not following project structure, new deps, needless comments | universal code quality |
 
-   A synthesis pass verifies every candidate against the code, merges duplicates and writes the review.
+   One agent instead of one per perspective plus a merge step, because the GLM Coding Plan allows very few concurrent
+   requests and a single agent that decides where to dig is what Cursor Bugbot and GitHub Copilot code review use too.
 3. **Every later review (label):** one short follow-up call on the changes since the last review. Earlier findings are re-checked as
    fixed / still open / deferred / no longer applies / not a defect; the bot replies "Fixed in <sha>" on its own threads and
    resolves them. New findings must be P0-P2 on newly changed lines (P0 anywhere); from the 4th review on, only P0/P1.
@@ -35,37 +37,32 @@ review runs and removes the label, so you can add it again later.
    lists what it should state; when the PR makes the rulebook outdated it says what to update.
 4. The review has a plain header (`Code review: Changes requested | Worth a look | Looks good`; only P0/P1 count as
    changes requested), inline comments (max 25, `suggestion` blocks for one-line fixes or deletions), severity, confidence
-   and lenses per finding, and the model in the footer. P3/nit findings below 0.7 confidence are dropped.
+   and perspective per finding, and the model in the footer. P3/nit findings below 0.7 confidence are dropped.
 5. Fixes must be minimal, keep the build and tests green, and never add abstractions, dependencies or refactors.
    Comments added in the diff that restate code, tell history, leak chat/task context or read like notes to an AI are flagged.
 
 It always writes in English and never approves or blocks in GitHub's review state (always `COMMENT`).
-Cost on the GLM Coding Plan Pro: about 150 credits and 3-4 minutes for the first review of a small PR, about 10
-credits and under a minute for a follow-up. The job log shows each review call as it starts and finishes, with how many
-are done.
+The job log shows what the agent is doing as it happens: every file it reads or searches, every provider retry
+(for example HTTP 429 "Too much concurrency" from the GLM Coding Plan), and per call the turns, tool calls and tokens.
 
-## Large PRs
-A review runs all its model calls in one wave and finishes within `time_budget` (15 minutes), whatever the PR size:
-the lens calls get the first 10 minutes and the synthesis the rest. A call still running at its deadline is stopped;
-the review is then posted with what finished and says which part is incomplete (unverified lens findings when the
-synthesis is stopped). The diff is split into batches of about 120k characters (`batch_chars`), code
-first, then tests, docs and styles, then data. Lockfiles, binaries and minified files are skipped; data files are cut
-at 30k characters, and when one folder has 10 or more changed data files of one type only 2 go into the diff and the
-rest are listed for the reviewers to open.
+## Time budget and large PRs
+A review finishes within `time_budget` (15 minutes). Two minutes before the end the agent is told to stop exploring and
+return what it has verified; at the end it is stopped. Only one review per machine uses the model at a time (a lock in
+`run.sh`); a review waiting for the lock starts its budget once it gets it.
 
-- **Detailed review:** when every batch fits in one wave (`parallel` / 3 batches for the lenses, `parallel` for a
-  follow-up), every lens reviews every batch. With the default `parallel: 3` that is a diff up to about 120k characters.
-- **Broad review of a large PR:** otherwise the reviewers get code and tests only, in the same number of batches. Each
-  file keeps a fair share of its diff; when that share would be too small, every file is shown as an outline (its
-  top-level added lines: declarations, exports, routes). Docs, styles and data are listed. The reviewers look at
-  architecture, contracts, migrations, security-sensitive paths and error handling, open the riskiest files
-  themselves (at most 5 files), and report P0-P2 only. The long checklists are left out to save time. A 437-file
-  PR with 4.6M characters of diff becomes 3 lens calls instead of 57.
+The diff goes into the prompt up to `batch_chars` (120k characters), code first, then tests, docs and styles, then
+data. Lockfiles, binaries and minified files are skipped; data files are cut at 30k characters, and when one folder has
+10 or more changed data files of one type only 2 go into the diff and the rest are listed for the agent to open.
 
-Raising `parallel` (if your provider's rate limit allows) makes more PRs fit a detailed review. One runner reviews one
-PR at a time; to review several PRs at once, install more runners on the machine with the same label
-(`RUNNER_NAME=<host>-<repo>-2 ./install.sh <owner>/<repo>`). Each running review makes up to `parallel` model calls
-at once, so 3 runners with `parallel: 3` make up to 9.
+- **Detailed review:** a diff that fits is reviewed line by line, all severities.
+- **Broad review of a large PR:** otherwise the agent gets code and tests only. Each file keeps a fair share of its
+  diff; when that share would be too small, every file is shown as an outline (its top-level added lines:
+  declarations, exports, routes). Docs, styles and data are listed. The agent looks at architecture, contracts,
+  migrations, security-sensitive paths and error handling, opens the riskiest files itself (at most 5), and reports
+  P0-P2 only.
+
+One runner reviews one PR at a time; more runners on the machine (`RUNNER_NAME=<host>-<repo>-2 ./install.sh
+<owner>/<repo>`) take the next PRs, check them out and wait for the model lock.
 
 ## Two review modes
 The mode is picked from the PR's head branch (`release_from` input, default `staging`):
@@ -78,9 +75,8 @@ The mode is picked from the PR's head branch (`release_from` input, default `sta
 ## Files
 | File | Purpose |
 |---|---|
-| `review.py` | Orchestration: PR data, parallel lenses, synthesis or follow-up, posting, thread resolution |
-| `prompts/base.md` | Lens reviewer instructions and output contract |
-| `prompts/synthesis.md` | Lead reviewer instructions and final output contract |
+| `review.py` | Orchestration: PR data, the review or follow-up agent run (Pi RPC mode), posting, thread resolution |
+| `prompts/review.md` | Reviewer instructions and output contract |
 | `prompts/followup.md` | Follow-up review instructions for later pushes |
 | `vendor/code-review-skill/` | Checklists from [awesome-skills/code-review-skill](https://github.com/awesome-skills/code-review-skill) (MIT, pinned commit in `SOURCE.md`) |
 | `run.sh` | Runner entrypoint: loads the API key file and calls `review.py` |
@@ -144,8 +140,8 @@ checked version on purpose.
 |---|---|---|
 | `runs_on` | `["self-hosted", "s10-review"]` | Runner labels (JSON list) |
 | `model` | `zai/glm-5.3-flash` | Pi model spec (`provider/model`); `pi --list-models` lists them, e.g. `zai/glm-5.3` for deeper and slower reviews |
-| `thinking` | `high` | Pi thinking level (`off` ... `max`); lower is faster |
-| `parallel` | `3` | Review calls running at once; a PR whose batches need more than one wave gets a broad review |
+| `thinking` | `medium` | Pi thinking level (`off` ... `max`); lower is faster |
+| `parallel` | `1` | Follow-up calls at once for a follow-up larger than one batch; keep 1 on plans with low concurrency |
 | `batch_chars` | `120000` | Diff characters per review call; larger diffs are split into batches |
 | `time_budget` | `15` | Minutes for the whole review; calls still running at the end are stopped (`0` = no limit) |
 | `release_from` | `staging` | Head branch that gets a release review |
