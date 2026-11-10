@@ -69,12 +69,28 @@ skipped (a fork must never reach a self-hosted runner).
 
 ### The review
 
-A plain header (`Code review: Changes requested | Worth a look | Looks good`; only P0/P1 count as changes requested), a
-summary, a description-vs-changes check, inline comments (max 25, with `suggestion` blocks for one-line fixes or deletions),
-and the model in the footer. Each finding has a severity (P0 must not merge, P1 serious, P2 normal, P3 low, nit trivial),
-a confidence and the perspective that found it. P3 and nit findings below 0.7 confidence are dropped. Fixes must be
-minimal, keep the build and tests green, and never add abstractions, dependencies or refactors. Comments added in the diff
-that restate code, tell history or read like notes to an AI are flagged. It always writes in English.
+**Every finding is its own comment thread**, attached to its line in the diff, so each one can be discussed and resolved on
+its own. A finding that is not about a changed line (a missing test, a PR that should be split) is attached to the first
+changed line of its file, or of the PR, with a note saying what it is really about. Only beyond 25 findings are the rest
+listed in the review body without a thread.
+
+The review body is short and ordered by what you need to do:
+
+1. a header with the verdict (`Changes requested`, `Worth a look`, `Looks good`, or `Incomplete` when a call failed or the
+   time budget ran out; only P0/P1 count as changes requested) and one line with the counts, for example
+   `2 P1, 3 P2. Fix the P1 findings before merging.`
+2. a summary of at most three sentences,
+3. a table of the findings (severity, title, a link to the line at the reviewed commit); a follow-up adds a status column
+   (New, Open, Fixed, Deferred, No longer applies, Not a defect),
+4. gaps in tests, feedback on the rulebook, the Dependabot line, and, collapsed, the description check and what was not
+   reviewed line by line.
+
+Each comment has the same parts: the problem and its trigger, the impact, and the fix. A one-line fix on an added line is a
+GitHub `suggestion` block (with the line's own indentation, so it can be applied with one click); a fix that needs more
+lines is a code block tagged with the file's language; a finding without a concrete fix has no code block. P3 and nit
+findings below 0.7 confidence are dropped. Fixes must be minimal, keep the build and tests green, and never add
+abstractions, dependencies or refactors. Comments added in the diff that restate code, tell history or read like notes to an
+AI are flagged. It always writes in English.
 
 The job log shows what the agent does as it happens: every file it reads or searches, every provider retry (for example
 HTTP 429 "Too much concurrency"), and per call the turns, tool calls and tokens.
@@ -272,8 +288,7 @@ in `run.sh` already makes one review at a time use the model, which suits a sing
 - The first review of a very large PR is broad, not line by line.
 - The merge button is only blocked with branch protection (see step 7 above).
 - A bot approval is not dismissed by later pushes (that is a branch protection feature); only the label starts a new review.
-- Findings that are not tied to a changed line cannot be resolved as threads. They do not turn the gate red, but they prevent
-  the approval.
+- Findings beyond the 25-comment limit have no thread. They do not turn the gate red, but they prevent the approval.
 - One review at a time per machine uses the model; others wait for the lock.
 
 ## Troubleshooting

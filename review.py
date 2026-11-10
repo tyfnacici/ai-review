@@ -31,6 +31,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
@@ -59,8 +60,8 @@ BROAD_NOTE = (
     "config. Open at most 5 files, the ones that look riskiest. Skip local style and minor issues; report "
     "P0-P2 only.\n\n")
 SEVERITIES = ["P0", "P1", "P2", "P3", "nit"]
-PRIOR_STATUS_LABEL = {"resolved": "fixed", "still_open": "still open", "deferred": "deferred",
-                      "obsolete": "no longer applies", "rejected": "not a defect"}
+CLOSED_LABEL = {"resolved": "Fixed", "deferred": "Deferred", "obsolete": "No longer applies", "rejected": "Not a defect"}
+MAX_BODY = 60_000  # GitHub rejects a review body or comment over 65536 characters
 MIN_MINOR_CONFIDENCE = 0.7  # P3/nit below this are dropped
 
 PERSPECTIVES = {
@@ -302,7 +303,7 @@ def perspectives_prompt(paths):
 
 
 def commentable_lines(diff):
-    """Map path -> {new-file line: is_added} for lines GitHub accepts as RIGHT-side anchors."""
+    """Map path -> {new-file line: diff row} for lines GitHub accepts as RIGHT-side anchors; a row starts with + or a space."""
     lines, path, new_line = {}, None, 0
     for row in diff.splitlines():
         if row.startswith("+++ "):
@@ -315,7 +316,7 @@ def commentable_lines(diff):
         if path is None or row.startswith(("--- ", "diff ", "index ")):
             continue
         if row.startswith("+") or row.startswith(" "):
-            lines.setdefault(path, {})[new_line] = row.startswith("+")
+            lines.setdefault(path, {})[new_line] = row
             new_line += 1
     return lines
 
@@ -346,7 +347,7 @@ def delta_since(workdir, prior, head):
     if ancestor.returncode != 0:
         return None  # force-push or rebase: anchors are unreliable, review fresh
     diff = local_diff(workdir, prior["head"], head)
-    return {p: {n for n, added in lines.items() if added} for p, lines in commentable_lines(diff).items()}, diff
+    return {p: {n for n, row in lines.items() if row.startswith("+")} for p, lines in commentable_lines(diff).items()}, diff
 
 
 def batch_note(batches, i, skipped, sampled):
@@ -474,76 +475,136 @@ def write_temp(text):
     return fh.name
 
 
-def verdict_of(findings):
+def verdict_of(findings, incomplete=False):
     """Host-owned verdict: only P0/P1 block; the model's own opinion is advisory."""
     if any(f.get("severity") in ("P0", "P1") for f in findings):
         return "Changes requested"
     if any(f.get("severity") in ("P2", "P3") for f in findings):
         return "Worth a look"
-    return "Looks good"
+    return "Incomplete" if incomplete else "Looks good"
 
 
-def finding_md(f, with_location):
-    loc = f"`{f.get('path') or 'repo-wide'}{':' + str(f['line']) if f.get('line') else ''}` " if with_location else ""
-    conf = f" · confidence {f['confidence']:.1f}" if isinstance(f.get("confidence"), (int, float)) else ""
-    lenses = f" · {', '.join(f['lenses'])}" if isinstance(f.get("lenses"), list) and f["lenses"] else ""
-    return f"{f.get('severity')} {loc}**{f.get('title', '')}**{conf}{lenses}"
+def finding_md(f):
+    return f"{f.get('severity')} **{f.get('title', '')}**"
 
 
-def inline_body(f, is_added_line):
-    body = f"{finding_md(f, False)}\n\n{f.get('body', '').strip()}"
-    suggestion = f.get("suggestion")
-    if f.get("delete_line") is True and is_added_line:
-        body += "\n\n```suggestion\n```"
-    elif isinstance(suggestion, str) and suggestion.strip() and is_added_line:
-        body += f"\n\n```suggestion\n{suggestion.rstrip()}\n```"
-    return body
+def finding_block(f):
+    parts = [finding_md(f), (f.get("body") or "").strip()]
+    for label, key in (("Impact", "impact"), ("Fix", "fix")):
+        if isinstance(f.get(key), str) and f[key].strip():
+            parts.append(f"**{label}:** {f[key].strip()}")
+    return "\n\n".join(p for p in parts if p)
 
 
-def render(result, findings, unanchored, prior_status, errors, cut_short, suppressed, mode, followup, model,
-           elapsed, head_sha, calls, skipped, sampled, broad, alerts=""):
+def fenced(code, tag=""):
+    fence = "`" * max(3, max((len(m) for m in re.findall(r"`+", code)), default=0) + 1)
+    return f"{fence}{tag}\n{code}\n{fence}"
+
+
+def anchor_for(f, valid):
+    """(path, line, moved): the changed line a finding's thread is attached to. A finding that is not about a changed
+    line goes to the first changed line of its file, or of the PR, so that it still is a thread that can be resolved."""
+    rows = valid.get(f.get("path"))
+    if rows and isinstance(f.get("line"), int) and f["line"] in rows:
+        return f["path"], f["line"], False
+    path = f.get("path") if rows else next(iter(valid), None)
+    return (path, min(valid[path]), True) if path else None
+
+
+def inline_body(f, row, moved):
+    body = finding_block(f)
+    if moved:
+        where = f"`{f['path']}:{f['line']}`" if f.get("path") and f.get("line") else f"`{f.get('path') or 'the repository'}`"
+        body += f"\n\nThis comment is attached to a changed line only so that it can be resolved; the finding is about {where}."
+    current, added = row[1:], not moved and row.startswith("+")
+    suggestion = (f.get("suggestion") or "").strip() if isinstance(f.get("suggestion"), str) else ""
+    code = f.get("fix_code") if isinstance(f.get("fix_code"), str) else ""
+    if f.get("delete_line") is True and added:
+        body += ("" if f.get("fix") else "\n\n**Fix:** Remove this line.") + "\n\n```suggestion\n```"
+    elif added and suggestion and "\n" not in suggestion:
+        indent = current[: len(current) - len(current.lstrip())]
+        if indent + suggestion != current:
+            body += "\n\n" + fenced(indent + suggestion, "suggestion")
+    elif suggestion and "\n" in suggestion and not code.strip():
+        code = suggestion
+    if code.strip() and "```suggestion" not in body:
+        lines = code.strip("\n").splitlines()
+        body += "\n\n" + fenced("\n".join(lines[:40] + (["..."] if len(lines) > 40 else [])),
+                                  os.path.splitext(f.get("path") or "")[1][1:])
+    return body[:MAX_BODY]
+
+
+def location(f, repo, sha):
+    path, line = f.get("path"), f.get("line")
+    if not path:
+        return "repo-wide"
+    url = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{repo}/blob/{sha}/{urllib.parse.quote(path)}"
+    return f"[`{path}:{line}`]({url}#L{line})" if isinstance(line, int) else f"[`{path}`]({url})"
+
+
+def findings_table(rows, followup, repo, sha):
+    lines = ["| Status | Severity | Finding | Location |" if followup else "| Severity | Finding | Location |",
+             "|---|---|---|---|" if followup else "|---|---|---|"]
+    for status, f in rows:
+        title = (f.get("title") or "").replace("|", "\\|").replace("\n", " ")
+        cells = ([status] if followup else []) + [f.get("severity"), title, location(f, repo, sha)]
+        lines.append("| " + " | ".join(str(c) for c in cells) + " |")
+    return "\n".join(lines)
+
+
+def render(result, findings, overflow, prior_status, errors, cut_short, suppressed, mode, followup, model,
+           elapsed, head_sha, calls, skipped, sampled, broad, repo, alerts=""):
     kinds = [k for k, on in (("release review", mode == "release"), ("broad review of a large PR", broad),
                              ("follow-up", followup)) if on]
     kind = f" ({', '.join(kinds)})" if kinds else ""
-    parts = [f"## Code review{kind}: {verdict_of(findings)}"]
-    if followup and not findings:
-        parts.append("**All previous findings are addressed and the new changes raise nothing new. No new comments.**")
-    parts.append((result.get("summary") or "").strip())
-    dc = result.get("description_consistency")
-    if dc:
-        parts.append(f"**Description vs. changes ({'consistent' if dc.get('ok') else 'inconsistent'}):** {(dc.get('notes') or '').strip()}")
-    if (result.get("scope_notes") or "").strip():
-        parts.append(f"**Simplicity & scope:** {result['scope_notes'].strip()}")
+    parts = [f"## Code review{kind}: {verdict_of(findings, bool(errors or cut_short))}"]
+    new = [f for f in findings if not f.get("prior_id")]
+    closed = [p for p in prior_status if p.get("status") in CLOSED_LABEL]
     if findings:
-        counts = ", ".join(f"{sum(f.get('severity') == s for f in findings)}× {s}" for s in SEVERITIES
+        counts = ", ".join(f"{sum(f.get('severity') == s for f in findings)} {s}" for s in SEVERITIES
                            if any(f.get("severity") == s for f in findings))
-        parts.append(f"**Findings:** {counts}")
-    if prior_status:
-        parts.append("**Earlier findings:**\n" + "\n".join(
-            f"- {PRIOR_STATUS_LABEL.get(p.get('status'), p.get('status'))}: {p['title']}"
-            f"{' — ' + p['note'] if p.get('note') else ''}" for p in prior_status))
-    if unanchored:
-        parts.append("**Other findings** (not tied to a changed line):\n" + "\n".join(
-            f"- {finding_md(f, True)}: {f.get('body', '').strip()}" for f in unanchored))
-    if (result.get("testing_notes") or "").strip():
-        parts.append(f"**Testing:** {result['testing_notes'].strip()}")
-    if (result.get("context_notes") or "").strip():
-        parts.append(f"**Project rulebook (CLAUDE.md):** {result['context_notes'].strip()}")
-    parts.append(alerts)
+        blocking = " and ".join(p for p in ("P0", "P1") if any(f.get("severity") == p for f in findings))
+        action = f" Fix the {blocking} findings before merging." if blocking else " Worth a look before merging."
+        parts.append(f"**{counts}.**{action}" + (f" {len(findings) - len(new)} still open, {len(new)} new." if followup else ""))
+    elif followup and prior_status:
+        parts.append(f"**All {len(prior_status)} earlier finding(s) are closed.** The new commits raise nothing new.")
+    else:
+        parts.append("**No findings.**" + (" The new commits raise nothing new." if followup else ""))
     if errors:
         parts.append("**Incomplete:** these review calls failed and their part was skipped: " + ", ".join(errors))
     if cut_short:
-        parts.append("<sub>The review reached its time budget, so it was asked to finish with what it had verified.</sub>")
+        parts.append("**Incomplete:** the review reached its time budget and was asked to finish with what it had verified.")
+    parts.append((result.get("summary") or "").strip())
+    rows = [("Open" if f.get("prior_id") else "New", f) for f in findings] + [(CLOSED_LABEL[p["status"]], p) for p in closed]
+    if rows:
+        parts.append(findings_table(rows, followup, repo, head_sha))
+    if overflow:
+        parts.append(f"**Findings without a thread** (the limit of {MAX_INLINE} comments was reached):\n\n"
+                     + "\n\n".join(finding_block(f) for f in overflow))
+    if (result.get("testing_notes") or "").strip():
+        parts.append(f"**Tests**\n\n{result['testing_notes'].strip()}")
+    if (result.get("context_notes") or "").strip():
+        parts.append(f"**Rulebook (CLAUDE.md)**\n\n{result['context_notes'].strip()}")
+    dc = result.get("description_consistency") or {}
+    if dc and not dc.get("ok"):
+        parts.append(f"**Description vs. changes: inconsistent.** {(dc.get('notes') or '').strip()}")
+    parts.append(alerts)
+    notes = []
+    if dc.get("ok") and (dc.get("notes") or "").strip():
+        notes.append(f"**Description vs. changes: consistent.** {dc['notes'].strip()}")
     if skipped or sampled:
-        parts.append(f"<sub>Not reviewed line by line: {len(skipped)} lockfile/binary/minified file(s), "
-                     f"{len(sampled)} file(s) only listed for the reviewer to open as needed.</sub>")
+        notes.append("Not reviewed line by line: " + "; ".join(x for x in (
+            f"{len(skipped)} lockfile, binary or minified file(s) skipped" if skipped else "",
+            f"{len(sampled)} file(s) only listed for the reviewer to open as needed" if sampled else "") if x) + ".")
     if suppressed:
-        parts.append(f"<sub>{suppressed} new minor finding(s) on previously reviewed code were dropped to avoid review loops.</sub>")
+        notes.append(f"{suppressed} new minor finding(s) on previously reviewed code were dropped to avoid review loops.")
+    if notes:
+        parts.append("<details>\n<summary>Description check and coverage</summary>\n\n" + "\n\n".join(notes) + "\n\n</details>")
+    body = "\n\n".join(p for p in parts if p)[:MAX_BODY]
     carried = [{k: f.get(k) for k in ("severity", "title", "path", "line")} for f in findings]
     encoded = base64.b64encode(json.dumps(carried, ensure_ascii=False).encode()).decode()
-    parts.append(f"<sub>{model} · Pi · {mode} mode · {calls} · {elapsed:.0f}s · {head_sha[:7]}</sub>\n"
-                 f"<!-- {MARKER} head={head_sha} findings={encoded} -->")
-    return "\n\n".join(p for p in parts if p)
+    return (f"{body}\n\n<sub>P0 must not merge, P1 serious, P2 normal, P3 low · {model} · Pi · {mode} mode · {calls} · "
+            f"{elapsed:.0f}s · {head_sha[:7]}</sub>\n<!-- {MARKER} head={head_sha} findings={encoded} -->")
 
 
 THREADS_QUERY = """query($o:String!,$n:String!,$p:Int!){repository(owner:$o,name:$n){pullRequest(number:$p){
@@ -672,7 +733,8 @@ def main():
     # did not classify counts as still open, so nothing is silently dropped.
     prior_by_id = {f["id"]: f for f in (prior or {}).get("findings", [])}
     status_by_id = {p["id"]: p for p in result.get("prior_findings") or [] if p.get("id") in prior_by_id}
-    prior_status = [dict(status_by_id.get(i, {"id": i, "status": "still_open"}), title=f["title"])
+    prior_status = [dict(status_by_id.get(i, {"id": i, "status": "still_open"}),
+                                           **{k: f.get(k) for k in ("title", "severity", "path", "line")})
                     for i, f in prior_by_id.items()]
     allowed = SEVERITIES[:3] if a.mode == "release" or broad else SEVERITIES
     findings = [f for f in result.get("findings", []) if f.get("severity") in allowed
@@ -696,23 +758,23 @@ def main():
     valid = commentable_lines(diff)
     threads = open_bot_threads(a.repo, a.pr)
     open_titles = {t["title"] for t in threads}
-    anchored, unanchored, repeated = [], [], 0
+    placed, overflow, repeated = [], [], 0
     for f in findings:
-        line = f.get("line")
+        anchor = anchor_for(f, valid)
         if f.get("title") in open_titles:  # already has an open bot thread; do not repeat it
             repeated += 1
-        elif isinstance(line, int) and line in valid.get(f.get("path"), {}) and len(anchored) < MAX_INLINE:
-            anchored.append(f)
+        elif anchor and len(placed) < MAX_INLINE:
+            placed.append((f, *anchor))
         else:
-            unanchored.append(f)
+            overflow.append(f)
 
     review = {
         "commit_id": head,
         "event": "COMMENT",
-        "body": render(result, findings, unanchored, prior_status, a.errors, a.cut_short, suppressed, a.mode,
-                       followup, a.model, elapsed, head, calls, skipped, sampled, broad, alerts),
-        "comments": [{"path": f["path"], "line": f["line"], "side": "RIGHT",
-                      "body": inline_body(f, valid[f["path"]][f["line"]])} for f in anchored],
+        "body": render(result, findings, overflow, prior_status, a.errors, a.cut_short, suppressed, a.mode,
+                       followup, a.model, elapsed, head, calls, skipped, sampled, broad, a.repo, alerts),
+        "comments": [{"path": path, "line": line, "side": "RIGHT", "body": inline_body(f, valid[path][line], moved)}
+                     for f, path, line, moved in placed],
     }
     closed = close_fixed_threads(a.repo, a.pr, prior_status, threads, head, a.dry_run)
     # The bot approves only when nothing is left: no finding and no unresolved thread of its own.
@@ -721,7 +783,7 @@ def main():
         review["event"] = "APPROVE"
     print(json.dumps({"elapsed_s": round(elapsed), "followup": followup, "round": rounds + 1,
                       "findings": len(findings),
-                      "inline": len(anchored), "summary_only": len(unanchored), "already_posted": repeated,
+                      "threads": len(placed), "without_thread": len(overflow), "already_posted": repeated,
                       "suppressed": suppressed, "threads_resolved": closed, "errors": a.errors,
                       "cut_short": a.cut_short}))
     if a.dry_run:
