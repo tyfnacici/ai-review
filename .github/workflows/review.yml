@@ -4,10 +4,26 @@ name: AI review
 on:
   workflow_call:
     inputs:
+      runs_on:
+        description: Runner labels as a JSON list
+        type: string
+        default: '["self-hosted", "s10-review"]'
       model:
-        description: Pi model spec
+        description: Pi model spec (provider/model)
         type: string
         default: zai/glm-5.3
+      thinking:
+        description: Pi thinking level
+        type: string
+        default: high
+      parallel:
+        description: Review calls running at once
+        type: number
+        default: 3
+      batch_chars:
+        description: Diff characters per review call; larger diffs are split into batches
+        type: number
+        default: 120000
       release_from:
         description: PRs whose head is this branch get a release review (combined effect); all others a feature review
         type: string
@@ -23,11 +39,10 @@ jobs:
     if: >-
       github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
       && github.event.action != 'labeled'
-    runs-on: [self-hosted, s10-review]
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 10
     env:
       GITLEAKS: 8.30.1
-      GITLEAKS_SHA256: e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -39,9 +54,14 @@ jobs:
         run: |
           bin="$HOME/bin/gitleaks-$GITLEAKS"
           if [ ! -x "$bin" ]; then
+            case $(uname -m) in
+              aarch64|arm64) arch=arm64 sha=e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080 ;;
+              x86_64) arch=x64 sha=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb ;;
+              *) echo "unsupported architecture: $(uname -m)"; exit 1 ;;
+            esac
             tmp=$(mktemp -d)
-            curl -fsSL -o "$tmp/g.tgz" "https://github.com/gitleaks/gitleaks/releases/download/v$GITLEAKS/gitleaks_${GITLEAKS}_linux_arm64.tar.gz"
-            echo "$GITLEAKS_SHA256  $tmp/g.tgz" | sha256sum -c -
+            curl -fsSL -o "$tmp/g.tgz" "https://github.com/gitleaks/gitleaks/releases/download/v$GITLEAKS/gitleaks_${GITLEAKS}_linux_$arch.tar.gz"
+            echo "$sha  $tmp/g.tgz" | sha256sum -c -
             tar xzf "$tmp/g.tgz" -C "$tmp" gitleaks
             mkdir -p "$HOME/bin" && mv "$tmp/gitleaks" "$bin" && rm -rf "$tmp"
           fi
@@ -51,13 +71,13 @@ jobs:
 
   review:
     # Runs when the PR is opened or marked ready, and again whenever the trigger label is added; not on every push.
-    # Drafts and fork PRs are skipped (forks get no secrets and must never reach the s10 runner).
+    # Drafts and fork PRs are skipped (forks get no secrets and must never reach a self-hosted runner).
     if: >-
       github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
       && (contains(fromJSON('["opened", "reopened", "ready_for_review"]'), github.event.action)
           || (github.event.action == 'labeled' && github.event.label.name == inputs.trigger_label))
-    runs-on: [self-hosted, s10-review]
-    # Large PRs are reviewed in batches (about 3 lens calls per 120k characters of diff), so they can take hours.
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    # Large PRs are reviewed in batches (3 lens calls per batch_chars of diff), so they can take hours.
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -69,6 +89,9 @@ jobs:
       - name: Sync reviewer
         run: git -C "$HOME/ai-review" fetch -q origin main && git -C "$HOME/ai-review" reset -q --hard origin/main
 
+      - name: Update Pi
+        run: '"$HOME/ai-review/update-pi.sh" || echo "::warning::Pi update failed; using the installed version"'
+
       - name: Review
         env:
           GH_TOKEN: ${{ github.token }}
@@ -76,6 +99,9 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           WORKDIR: ${{ github.workspace }}
           MODEL: ${{ inputs.model }}
+          THINKING: ${{ inputs.thinking }}
+          PARALLEL: ${{ inputs.parallel }}
+          BATCH_CHARS: ${{ inputs.batch_chars }}
           MODE: ${{ github.head_ref == inputs.release_from && 'release' || 'feature' }}
         run: '"$HOME/ai-review/run.sh"'
 

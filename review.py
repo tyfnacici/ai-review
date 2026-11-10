@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AI PR review: review a GitHub PR with Pi (GLM Coding Plan) and post the result as one PR review.
+"""AI PR review: review a GitHub PR with the Pi coding agent and post the result as one PR review.
 
 Three lens reviewers run in parallel (correctness & contracts, security & performance,
 simplicity & scope), each with checklists from the vendored awesome-skills/code-review-skill.
@@ -10,14 +10,15 @@ The diff comes from the local checkout, so PRs of any size work; a large diff is
 and every lens (or follow-up call) reviews every batch.
 
 Usage: review.py --repo owner/name --pr N --workdir <checkout at PR head>
-                 [--mode feature|release] [--model zai/glm-5.3] [--thinking high] [--parallel 5]
-                 [--pi pi] [--dry-run]
+                 [--mode feature|release] [--model zai/glm-5.3] [--thinking high] [--parallel 3]
+                 [--batch-chars 120000] [--pi pi] [--dry-run]
 Feature mode reviews one change in depth; release mode (e.g. staging -> main) looks at the combined effect.
-Needs: gh (authenticated via GH_TOKEN), pi, ZAI_API_KEY in the environment.
+Needs: gh (authenticated via GH_TOKEN), pi, and the model provider's API key in the environment (e.g. ZAI_API_KEY).
 Project rules come from CLAUDE.md / AGENTS.md / .github/ai-review.md on the BASE branch.
 """
 import argparse
 import base64
+import itertools
 import json
 import os
 import re
@@ -33,7 +34,6 @@ GUIDES = os.path.join(HERE, "vendor", "code-review-skill", "reference")
 MARKER = "ai-review:v2"
 MARKER_RE = r"<!-- (?:ai-review:v2|muesli:v1) head=(\w+) findings=([A-Za-z0-9+/=]*) -->"  # v1 = older reviews
 CONTEXT_FILES = ["CLAUDE.md", "AGENTS.md", ".github/ai-review.md"]
-BATCH_CHARS = 120_000  # diff text per lens call; larger PRs are split into batches so every file is reviewed
 DATA_CHARS = 30_000  # a data file's diff is cut here; code diffs are never cut, only split into parts
 LOCKFILES = {"package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "Cargo.lock", "Gemfile.lock",
              "poetry.lock", "uv.lock", "composer.lock", "go.sum"}
@@ -90,6 +90,30 @@ LANGUAGE_GUIDES = {".rs": ["rust.md"], ".ts": ["typescript.md"], ".tsx": ["types
                    ".dart": ["dart.md"], ".css": ["css-less-sass.md"], ".scss": ["css-less-sass.md"]}
 
 
+def log(msg):
+    """Progress line for the Actions job log."""
+    print(f"{time.strftime('%H:%M:%S')} {msg}", file=sys.stderr, flush=True)
+
+
+def tracked(total):
+    """Wraps a call so each start and finish is logged with how many are done and an estimate of the time left."""
+    done, t0 = itertools.count(1), time.time()
+
+    def run(where, fn):
+        log(f"{where}: started")
+        start, ok = time.time(), False
+        try:
+            out = fn()
+            ok = not (isinstance(out, tuple) and out[2])  # run_lens reports its error instead of raising
+            return out
+        finally:
+            k = next(done)
+            left = (time.time() - t0) / k * (total - k)
+            log(f"{where}: {'done' if ok else 'failed'} in {time.time() - start:.0f}s ({k}/{total}"
+                + (f", about {left / 60:.0f} min left)" if k < total else ")"))
+    return run
+
+
 def gh(*args, input_text=None, check=True):
     out = subprocess.run(["gh", *args], input=input_text, capture_output=True, text=True)
     if check and out.returncode != 0:
@@ -129,8 +153,8 @@ def split_files(diff):
     return out
 
 
-def plan_batches(file_diffs):
-    """Pack file diffs into batches of about BATCH_CHARS. Returns (batches, skipped, sampled): lockfiles,
+def plan_batches(file_diffs, limit):
+    """Pack file diffs into batches of about `limit` characters. Returns (batches, skipped, sampled): lockfiles,
     binaries and minified files are skipped; in a folder with many changed data files only a sample goes in."""
     kind = lambda p: (os.path.dirname(p), os.path.splitext(p)[1].lower())
     bulk = Counter(kind(p) for p, _ in file_diffs if kind(p)[1] in DATA_EXTS)
@@ -147,8 +171,8 @@ def plan_batches(file_diffs):
                 continue
         if kind(path)[1] in DATA_EXTS and len(text) > DATA_CHARS:
             text = text[:DATA_CHARS] + f"\n[diff of {path} cut at {DATA_CHARS} characters; read the file for the rest]\n"
-        for part in split_large(text):
-            if batches[-1] and size + len(part) > BATCH_CHARS:
+        for part in split_large(text, limit):
+            if batches[-1] and size + len(part) > limit:
                 batches.append([])
                 size = 0
             batches[-1].append((path, part))
@@ -156,15 +180,15 @@ def plan_batches(file_diffs):
     return [b for b in batches if b], skipped, sampled
 
 
-def split_large(text):
+def split_large(text, limit):
     """A file diff larger than one batch, split by lines into parts that each repeat the file header."""
-    if len(text) <= BATCH_CHARS:
+    if len(text) <= limit:
         return [text]
     lines = text.splitlines(keepends=True)
     head = next((i for i, l in enumerate(lines) if l.startswith("@@")), 0)
     header, parts, cur = "".join(lines[:head]), [], ""
     for line in lines[head:]:
-        if cur and len(header) + len(cur) + len(line) > BATCH_CHARS:
+        if cur and len(header) + len(cur) + len(line) > limit:
             parts.append(cur)
             cur = ""
         cur += line
@@ -368,6 +392,8 @@ def render(result, findings, unanchored, prior_status, lens_errors, suppressed, 
             f"- {finding_md(f, True)}: {f.get('body', '').strip()}" for f in unanchored))
     if (result.get("testing_notes") or "").strip():
         parts.append(f"**Testing:** {result['testing_notes'].strip()}")
+    if (result.get("context_notes") or "").strip():
+        parts.append(f"**Project rulebook (CLAUDE.md):** {result['context_notes'].strip()}")
     if lens_errors:
         parts.append("**Incomplete:** these review calls failed and their part was skipped: " + ", ".join(lens_errors))
     if skipped or sampled:
@@ -434,6 +460,7 @@ def main():
     ap.add_argument("--model", default="zai/glm-5.3")
     ap.add_argument("--thinking", default="high")
     ap.add_argument("--parallel", type=int, default=len(LENSES))
+    ap.add_argument("--batch-chars", type=int, default=120_000)
     ap.add_argument("--mode", choices=["feature", "release"], default="feature")
     ap.add_argument("--pi", default="pi")
     ap.add_argument("--dry-run", action="store_true")
@@ -454,7 +481,9 @@ def main():
     follow = delta_since(a.workdir, prior, head)
     followup = follow is not None
     delta, review_diff = follow if followup else (None, diff)
-    batches, skipped, sampled = plan_batches(split_files(review_diff))
+    batches, skipped, sampled = plan_batches(split_files(review_diff), a.batch_chars)
+    log(f"{'follow-up' if followup else 'full'} {a.mode} review: {len(batches)} batch(es) of the diff, "
+        f"{len(skipped)} skipped and {len(sampled)} sampled file(s), {a.model}, {a.parallel} call(s) at a time")
     mode_note = RELEASE_NOTE if a.mode == "release" else ""
     label = "Changes since the previous review" if followup else "Diff"
 
@@ -476,6 +505,9 @@ def main():
             synth_text = batch_text(0) if len(batches) <= 1 else mode_note + pr_prompt(
                 meta, files, f"(not repeated here: the lens reviewers saw it in {len(batches)} batches; "
                 "read the files to verify findings)", inline, prior, label, batch_note([], 0, skipped, sampled))
+            if not context:
+                synth_text += (f"\nProject context: none (no {', '.join(CONTEXT_FILES)} on "
+                               f"`{meta['baseRefName']}`).\n")
             result, candidates, lens_errors = full_review(a, batches, ctx_path, batch_text, synth_text)
             total = len(LENSES) * max(1, len(batches))
             calls = f"{total - len(lens_errors)}/{total} lens calls + synthesis" + (
@@ -548,11 +580,14 @@ def full_review(a, batches, ctx_path, batch_text, synth_text):
     """Every lens on every batch in parallel, then one synthesis pass over all candidates."""
     tasks = [(name, i) for i in range(max(1, len(batches))) for name in LENSES]
     paths = lambda i: [p for p, _ in batches[i]] if batches else []
+    label = lambda name, i: f"{name} (batch {i + 1}/{len(batches)})" if len(batches) > 1 else name
+    track = tracked(len(tasks))
     with ThreadPoolExecutor(max_workers=max(1, a.parallel)) as pool:
-        results = list(pool.map(lambda t: run_lens(a, t[0], paths(t[1]), ctx_path, batch_text(t[1])) + (t[1],), tasks))
+        results = list(pool.map(lambda t: track(label(*t), lambda: run_lens(
+            a, t[0], paths(t[1]), ctx_path, batch_text(t[1]))) + (t[1],), tasks))
     candidates, notes, lens_errors = [], [], []
     for name, out, err, i in results:
-        where = f"{name} (batch {i + 1}/{len(batches)})" if len(batches) > 1 else name
+        where = label(name, i)
         if err:
             lens_errors.append(where)
             print(f"lens {where} failed: {err}", file=sys.stderr)
@@ -568,8 +603,9 @@ def full_review(a, batches, ctx_path, batch_text, synth_text):
                      json.dumps(candidates, ensure_ascii=False, indent=1) +
                      "\n\nProduce the final review. Return only the JSON object.")
     try:
-        result = run_pi(a, [os.path.join(HERE, "prompts", "synthesis.md")] + ([ctx_path] if ctx_path else []),
-                        synthesis_msg, timeout=min(3600, LENS_TIMEOUT + 20 * len(candidates)))
+        result = tracked(1)(f"synthesis of {len(candidates)} candidate(s)", lambda: run_pi(
+            a, [os.path.join(HERE, "prompts", "synthesis.md")] + ([ctx_path] if ctx_path else []),
+            synthesis_msg, timeout=min(3600, LENS_TIMEOUT + 20 * len(candidates))))
     except Exception as e:  # a big PR's lens work must not be lost to one failed call
         print(f"synthesis failed: {e}", file=sys.stderr)
         lens_errors.append("synthesis")
@@ -584,12 +620,14 @@ def followup_review(a, batches, ctx_path, batch_text, prior):
     its file, or in the first batch when no batch does."""
     paths = [{p for p, _ in b} for b in batches] or [set()]
     touched = set().union(*paths)
+    track = tracked(len(paths))
 
     def call(i):
         mine = [f for f in prior["findings"] if f.get("path") in paths[i] or (i == 0 and f.get("path") not in touched)]
-        return run_pi(a, [os.path.join(HERE, "prompts", "followup.md")] + ([ctx_path] if ctx_path else []),
-                      batch_text(i, dict(prior, findings=mine)) + "\nDo the follow-up review. Return only the JSON object.",
-                      timeout=LENS_TIMEOUT)
+        return track(f"follow-up (batch {i + 1}/{len(paths)})", lambda: run_pi(
+            a, [os.path.join(HERE, "prompts", "followup.md")] + ([ctx_path] if ctx_path else []),
+            batch_text(i, dict(prior, findings=mine)) + "\nDo the follow-up review. Return only the JSON object.",
+            timeout=LENS_TIMEOUT))
     with ThreadPoolExecutor(max_workers=max(1, a.parallel)) as pool:
         parts = list(pool.map(call, range(len(paths))))
     return {"summary": " ".join((r.get("summary") or "").strip() for r in parts).strip(),
