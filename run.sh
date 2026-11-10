@@ -14,4 +14,5 @@ PI="$HOME/pi/pi"
 [ -x "$PI" ] || PI=pi
 exec python3 -I "$HERE/review.py" --repo "$REPO" --pr "$PR" --workdir "$WORKDIR" \
   --pi "$PI" --model "${MODEL:-zai/glm-5.3-flash}" --thinking "${THINKING:-high}" \
-  --parallel "${PARALLEL:-3}" --batch-chars "${BATCH_CHARS:-120000}" --mode "${MODE:-feature}"
+  --parallel "${PARALLEL:-3}" --batch-chars "${BATCH_CHARS:-120000}" \
+  --time-budget "${TIME_BUDGET:-15}" --mode "${MODE:-feature}"

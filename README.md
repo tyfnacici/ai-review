@@ -45,8 +45,10 @@ credits and under a minute for a follow-up. The job log shows each review call a
 are done.
 
 ## Large PRs
-A review runs all its model calls in one wave, so it takes about as long as one call plus the synthesis (around
-5-15 minutes), whatever the PR size. The diff is split into batches of about 120k characters (`batch_chars`), code
+A review runs all its model calls in one wave and finishes within `time_budget` (15 minutes), whatever the PR size:
+the lens calls get the first 10 minutes and the synthesis the rest. A call still running at its deadline is stopped;
+the review is then posted with what finished and says which part is incomplete (unverified lens findings when the
+synthesis is stopped). The diff is split into batches of about 120k characters (`batch_chars`), code
 first, then tests, docs and styles, then data. Lockfiles, binaries and minified files are skipped; data files are cut
 at 30k characters, and when one folder has 10 or more changed data files of one type only 2 go into the diff and the
 rest are listed for the reviewers to open.
@@ -57,7 +59,8 @@ rest are listed for the reviewers to open.
   file keeps a fair share of its diff; when that share would be too small, every file is shown as an outline (its
   top-level added lines: declarations, exports, routes). Docs, styles and data are listed. The reviewers look at
   architecture, contracts, migrations, security-sensitive paths and error handling, open the riskiest files
-  themselves, and report P0-P2 only. A 437-file PR with 4.6M characters of diff becomes 3 lens calls instead of 57.
+  themselves (at most 5 files), and report P0-P2 only. The long checklists are left out to save time. A 437-file
+  PR with 4.6M characters of diff becomes 3 lens calls instead of 57.
 
 Raising `parallel` (if your provider's rate limit allows) makes more PRs fit a detailed review. One runner reviews one
 PR at a time; to review several PRs at once, install more runners on the machine with the same label
@@ -144,6 +147,7 @@ checked version on purpose.
 | `thinking` | `high` | Pi thinking level (`off` ... `max`); lower is faster |
 | `parallel` | `3` | Review calls running at once; a PR whose batches need more than one wave gets a broad review |
 | `batch_chars` | `120000` | Diff characters per review call; larger diffs are split into batches |
+| `time_budget` | `15` | Minutes for the whole review; calls still running at the end are stopped (`0` = no limit) |
 | `release_from` | `staging` | Head branch that gets a release review |
 | `trigger_label` | `ai-review` | Label that runs the review again |
 
