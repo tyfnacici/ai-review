@@ -4,8 +4,9 @@ Automatic pull request review for GitHub, running on your own machine. A coding 
 reads the PR with read-only tools and posts one review; deterministic checks scan the PR for leaked secrets and newly
 introduced vulnerable dependencies; a gate check stays red until every review thread is resolved.
 
-It runs as a self-hosted GitHub Actions runner on any Linux machine (x64 or arm64). Your code is sent to the model
-provider you choose and nowhere else, and the API key never leaves that machine.
+It runs as a self-hosted GitHub Actions runner on any Linux machine (x64 or arm64) with a hosted model or one running on
+your own hardware (Ollama, llama.cpp, LM Studio, vLLM). Your code is sent to the model you choose and nowhere else, and
+the API key never leaves that machine.
 
 ## The problem
 
@@ -117,8 +118,9 @@ The mode is picked from the PR's head branch (`release_from` input, default `sta
 
 - A Linux machine (x64 or arm64) with systemd, `sudo`, `git`, `curl`, `python3` (3.9+) and [`gh`](https://cli.github.com)
   logged in as an admin of the repository. It only makes outgoing connections; no inbound port is needed.
-- An API key for a model provider that Pi supports (`pi --list-models` after install). The default model is
-  `zai/glm-5.3-flash`, which needs a Z.ai key; set the `model` input to use another provider.
+- A model: either an API key for a provider that Pi supports (`pi --list-models` after install), or a local server with an
+  OpenAI-compatible API (see [Local models](#local-models)). The default model is `zai/glm-5.3-flash`, which needs a Z.ai
+  key; set the `model` input to use another one.
 
 ## Install on a Linux machine
 
@@ -205,13 +207,50 @@ sudo -u ai-review ./config.sh remove --token "$(gh api -X POST repos/<owner>/<re
 | Input | Default | Meaning |
 |---|---|---|
 | `runs_on` | `["self-hosted", "ai-review"]` | Runner labels (JSON list) |
-| `model` | `zai/glm-5.3-flash` | Pi model spec (`provider/model`); `pi --list-models` lists them, e.g. `zai/glm-5.3` for deeper and slower reviews |
+| `model` | `zai/glm-5.3-flash` | Pi model spec (`provider/model`); `pi --list-models` lists them, e.g. `zai/glm-5.3` for deeper and slower reviews, or `local/<id>` for a [local model](#local-models) |
 | `thinking` | `medium` | Pi thinking level (`off` ... `max`); lower is faster |
 | `parallel` | `1` | Follow-up calls at once for a follow-up larger than one batch; keep 1 on plans with low concurrency |
 | `batch_chars` | `120000` | Diff characters per review call; larger diffs are split into batches |
 | `time_budget` | `15` | Minutes for the whole review; `0` = no limit |
 | `release_from` | `staging` | Head branch that gets a release review |
 | `trigger_label` | `ai-review` | Label that runs the review again |
+
+## Local models
+
+Pi talks to any server with an OpenAI-compatible API, so the review can run on a model on your own hardware and no code
+leaves your network. The reviewer needs a model that supports tool calling and follows instructions well; small models
+find fewer bugs and add more noise than a hosted one.
+
+1. Run the server (Ollama, `llama serve`, LM Studio, vLLM, ...) so the runner machine can reach it, with a context window
+   of at least 32k tokens.
+2. Describe it for Pi in `/opt/ai-review/.pi-agent/models.json` (as the runner user, so the file belongs to it):
+   ```json
+   {
+     "providers": {
+       "local": {
+         "baseUrl": "http://localhost:11434/v1",
+         "api": "openai-completions",
+         "apiKey": "local",
+         "models": [{ "id": "qwen2.5-coder:7b", "contextWindow": 32768, "maxTokens": 4096 }]
+       }
+     }
+   }
+   ```
+   `id` is the model name the server expects, `contextWindow` must match what the server was started with, and `apiKey` is
+   any placeholder unless the server checks one (then use `"$NAME"` to read it from the key file). Check it with
+   `sudo -u ai-review env PI_CODING_AGENT_DIR=/opt/ai-review/.pi-agent /opt/ai-review/pi/pi --list-models local`.
+3. Select it in the calling workflow and size the diff to the context window:
+   ```yaml
+   with:
+     model: local/qwen2.5-coder:7b
+     batch_chars: 48000        # about 1.5 characters per context token (32k tokens)
+     time_budget: 30           # local models are slower
+     thinking: "off"           # for models that do not reason
+   ```
+
+A diff larger than `batch_chars` gets the broad review, so a small context window means more broad reviews. The model lock
+in `run.sh` already makes one review at a time use the model, which suits a single GPU. See the Pi documentation
+(`docs/models.md`, `docs/llama-cpp.md`) for more server and provider options.
 
 ## Security model
 
@@ -248,6 +287,7 @@ sudo -u ai-review ./config.sh remove --token "$(gh api -X POST repos/<owner>/<re
 | `gate` stays red after resolving threads | Re-run the `gate` job or add the `ai-review` label |
 | Review ends with "The review reached its time budget" | Large PR or slow model; raise `time_budget` or use a faster model |
 | Provider or key errors | Check the key file of the runner user and `pi --list-models` for the model name |
+| A local model does not answer or loops | The model lacks tool calling, the context window is smaller than `contextWindow` says, or `batch_chars` is too large for it |
 
 ## Files
 
