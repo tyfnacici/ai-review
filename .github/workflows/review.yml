@@ -24,6 +24,10 @@ on:
         description: Diff characters per review call; larger diffs are split into batches
         type: number
         default: 120000
+      time_budget:
+        description: Minutes for the whole review; calls still running at the end are stopped (0 = no limit)
+        type: number
+        default: 15
       release_from:
         description: PRs whose head is this branch get a release review (combined effect); all others a feature review
         type: string
@@ -77,7 +81,7 @@ jobs:
       && (contains(fromJSON('["opened", "reopened", "ready_for_review"]'), github.event.action)
           || (github.event.action == 'labeled' && github.event.label.name == inputs.trigger_label))
     runs-on: ${{ fromJSON(inputs.runs_on) }}
-    # All model calls run in one wave (a large PR gets a broad review), so a review takes minutes, not hours.
+    # All model calls run in one wave (a large PR gets a broad review) within time_budget.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -103,6 +107,7 @@ jobs:
           THINKING: ${{ inputs.thinking }}
           PARALLEL: ${{ inputs.parallel }}
           BATCH_CHARS: ${{ inputs.batch_chars }}
+          TIME_BUDGET: ${{ inputs.time_budget }}
           MODE: ${{ github.head_ref == inputs.release_from && 'release' || 'feature' }}
         run: '"$HOME/ai-review/run.sh"'
 
