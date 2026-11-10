@@ -9,6 +9,7 @@ machine and every model request leaves from its IP.
 | Job | What it does | Fails the check? |
 |---|---|---|
 | `secrets` | every push: [gitleaks](https://github.com/gitleaks/gitleaks) scans the lines the PR adds (values redacted in the log) | yes, on a leak |
+| `dependencies` | every push: [osv-scanner](https://github.com/google/osv-scanner) scans the lockfiles the PR changes at the base and at the head and reports only the vulnerabilities the PR adds (`package-lock.json`, `Cargo.lock`, `yarn.lock`, `pnpm-lock.yaml`, `poetry.lock`, `uv.lock`, `Pipfile.lock`, `Gemfile.lock`, `composer.lock`, `go.mod`) | yes, on a new HIGH or CRITICAL one |
 | `review` | when the PR is opened / marked ready, and again each time you add the `ai-review` label: AI review posted as one PR review by `github-actions[bot]` | no, advisory only |
 
 Pushes do not trigger the AI review. When you are done with the fixes, add the `ai-review` label to the PR; the
@@ -35,6 +36,8 @@ review runs and removes the label, so you can add it again later.
    When nothing is left it says "No new comments", so a PR converges instead of looping.
    The first review also gives feedback on the project rulebook: with no `CLAUDE.md` / `AGENTS.md` it asks for one and
    lists what it should state; when the PR makes the rulebook outdated it says what to update.
+   It also adds one line with the repository's open Dependabot alerts, and names the ones in lockfiles the PR changes
+   (needs `vulnerability-alerts: read` in the calling workflow; without it the line is left out).
 4. The review has a plain header (`Code review: Changes requested | Worth a look | Looks good`; only P0/P1 count as
    changes requested), inline comments (max 25, `suggestion` blocks for one-line fixes or deletions), severity, confidence
    and perspective per finding, and the model in the footer. P3/nit findings below 0.7 confidence are dropped.
@@ -80,6 +83,7 @@ The mode is picked from the PR's head branch (`release_from` input, default `sta
 | `prompts/followup.md` | Follow-up review instructions for later pushes |
 | `vendor/code-review-skill/` | Checklists from [awesome-skills/code-review-skill](https://github.com/awesome-skills/code-review-skill) (MIT, pinned commit in `SOURCE.md`) |
 | `run.sh` | Runner entrypoint: loads the API key file and calls `review.py` |
+| `deps.py` | Lockfile check of the `dependencies` job: new known vulnerabilities in a PR compared with its base |
 | `update-pi.sh` | Installs or updates Pi to its latest release; runs at the start of every review job |
 | `install.sh` | Sets up a self-hosted runner for ai-review on a Linux machine |
 | `.github/workflows/review.yml` | Reusable workflow (`secrets` + `review` jobs) called by projects |
@@ -106,8 +110,7 @@ sudo -u ai-review nano /opt/ai-review/.config/ai-review/env
 `pi --help` lists every provider and its variable. Overrides: `LABEL`, `RUNNER_NAME`, `KEY_FILE` (an env file to
 install), `AI_REVIEW_URL` (your fork), `RUNNER_USER`, `RUNNER_HOME`. Run it again for another repository; the user,
 Pi and key are shared. Pi updates itself at the start of every review job (the previous version stays in `~/pi.old`),
-the runner updates itself, and the reviewer code is synced from `main` before every job. gitleaks stays pinned to a
-checked version on purpose.
+the runner updates itself, and the reviewer code is synced from `main` before every job. gitleaks and osv-scanner stay pinned to checked versions on purpose.
 
 ## Adding it to a project
 1. Install a runner for the repository (above).
@@ -124,6 +127,7 @@ checked version on purpose.
    permissions:
      contents: write       # only so the bot can resolve its own fixed threads (GitHub requires it)
      pull-requests: write
+     vulnerability-alerts: read   # lets the review mention open Dependabot alerts
    jobs:
      review:
        uses: tyfnacici/ai-review/.github/workflows/review.yml@main
@@ -133,7 +137,7 @@ checked version on purpose.
    ```
 3. Create the label once: `gh label create ai-review -R <owner>/<repo> --description "Run the AI review again"`.
 4. Keep the project's `CLAUDE.md` up to date; it is the review rulebook.
-5. Turn on Dependabot alerts for the repo (alerts only; no automatic PRs needed).
+5. Turn on Dependabot alerts for the repo (alerts only; no automatic PRs needed). The `dependencies` job needs nothing else.
 
 ## Settings (workflow inputs)
 | Input | Default | Meaning |
