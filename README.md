@@ -13,7 +13,8 @@ Pushes do not trigger the AI review. When you are done with the fixes, add the `
 review runs and removes the label, so you can add it again later.
 
 ## How the AI review works
-1. Collect the PR title, description, discussion, changed files and diff with `gh`, plus the project rulebook
+1. Collect the PR title and discussion with `gh` and the diff with `git` from the checkout (GitHub's diff API stops
+   at 300 files, so PRs of any size work), plus the project rulebook
    (`CLAUDE.md` / `AGENTS.md` / optional `.github/ai-review.md`) from the **base** branch, so a PR cannot rewrite its own rules.
 2. **First review of a PR:** three lens reviewers run in parallel, each a separate Pi call with read-only tools and its own checklists:
 
@@ -37,6 +38,15 @@ review runs and removes the label, so you can add it again later.
 It always writes in English and never approves or blocks in GitHub's review state (always `COMMENT`).
 Cost on the Pro plan: about 150 credits and 3-4 minutes for the first review of a small PR, about 10 credits and
 under a minute for a follow-up.
+
+## Large PRs
+Every changed file is reviewed. When the diff is larger than about 120k characters it is split into batches by file
+(a single huge file diff is split into parts), and every lens reviews every batch; the synthesis pass then sees all
+candidates. Follow-ups are batched the same way. Exceptions, listed in the review footer: lockfiles, binaries and
+minified files are skipped; data files (`.json`, `.csv`, `.svg`, ...) are cut at 30k characters, and when one folder
+has 10 or more changed data files of one type only 2 go into the diff and the rest are listed for the reviewer to read.
+A PR with a 450k-character diff takes 4 batches (12 lens calls); one with 400+ files and 4.6M characters, mostly
+data, about 19 batches (57 calls) and can run for a few hours with 3 calls in parallel.
 
 ## Two review modes
 The mode is picked from the PR's head branch (`release_from` input, default `staging`):

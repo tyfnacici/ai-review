@@ -24,14 +24,18 @@ jobs:
       github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
       && github.event.action != 'labeled'
     runs-on: [self-hosted, s10-review]
-    timeout-minutes: 5
+    timeout-minutes: 10
     env:
       GITLEAKS: 8.30.1
       GITLEAKS_SHA256: e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
       - name: Scan added lines with gitleaks
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           bin="$HOME/bin/gitleaks-$GITLEAKS"
           if [ ! -x "$bin" ]; then
@@ -41,7 +45,8 @@ jobs:
             tar xzf "$tmp/g.tgz" -C "$tmp" gitleaks
             mkdir -p "$HOME/bin" && mv "$tmp/gitleaks" "$bin" && rm -rf "$tmp"
           fi
-          gh pr diff "${{ github.event.pull_request.number }}" -R "${{ github.repository }}" \
+          # Local diff: GitHub's diff API refuses PRs with more than 300 files.
+          git diff "origin/${{ github.base_ref }}...HEAD" \
             | { grep '^+' || true; } | "$bin" stdin --redact --no-banner -v
 
   review:
@@ -52,12 +57,13 @@ jobs:
       && (contains(fromJSON('["opened", "reopened", "ready_for_review"]'), github.event.action)
           || (github.event.action == 'labeled' && github.event.label.name == inputs.trigger_label))
     runs-on: [self-hosted, s10-review]
-    timeout-minutes: 20
+    # Large PRs are reviewed in batches (about 3 lens calls per 120k characters of diff), so they can take hours.
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 1
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Sync reviewer

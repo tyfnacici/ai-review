@@ -6,6 +6,8 @@ simplicity & scope), each with checklists from the vendored awesome-skills/code-
 A synthesis pass verifies, de-duplicates and writes the final review. Every later push gets one
 short follow-up call instead: earlier findings are re-checked (fixed ones get a reply and their
 thread is resolved) and only serious problems in the new changes are added, so a PR converges.
+The diff comes from the local checkout, so PRs of any size work; a large diff is split into batches
+and every lens (or follow-up call) reviews every batch.
 
 Usage: review.py --repo owner/name --pr N --workdir <checkout at PR head>
                  [--mode feature|release] [--model zai/glm-5.3] [--thinking high] [--parallel 5]
@@ -23,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -30,8 +33,14 @@ GUIDES = os.path.join(HERE, "vendor", "code-review-skill", "reference")
 MARKER = "ai-review:v2"
 MARKER_RE = r"<!-- (?:ai-review:v2|muesli:v1) head=(\w+) findings=([A-Za-z0-9+/=]*) -->"  # v1 = older reviews
 CONTEXT_FILES = ["CLAUDE.md", "AGENTS.md", ".github/ai-review.md"]
-MAX_DIFF_CHARS = 200_000
+BATCH_CHARS = 120_000  # diff text per lens call; larger PRs are split into batches so every file is reviewed
+DATA_CHARS = 30_000  # a data file's diff is cut here; code diffs are never cut, only split into parts
+LOCKFILES = {"package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "Cargo.lock", "Gemfile.lock",
+             "poetry.lock", "uv.lock", "composer.lock", "go.sum"}
+DATA_EXTS = {".json", ".csv", ".tsv", ".xml", ".svg", ".txt", ".geojson"}
+BULK_MIN, BULK_SAMPLE = 10, 2  # a folder with >= 10 changed data files of one type: 2 go in the diff, the rest are listed
 MAX_INLINE = 25
+LENS_TIMEOUT = 1200  # seconds per Pi call
 SEVERITIES = ["P0", "P1", "P2", "P3", "nit"]
 PRIOR_STATUS_LABEL = {"resolved": "fixed", "still_open": "still open", "deferred": "deferred",
                       "obsolete": "no longer applies", "rejected": "not a defect"}
@@ -98,10 +107,75 @@ def base_context(repo, base_ref):
     return "\n\n".join(parts)
 
 
-def lens_prompt(name, files):
+def git(workdir, *args):
+    out = subprocess.run(["git", "-C", workdir, *args], capture_output=True, text=True, errors="replace")
+    if out.returncode != 0:
+        sys.exit(f"git {' '.join(args[:2])} failed: {out.stderr.strip()}")
+    return out.stdout
+
+
+def local_diff(workdir, base, head):
+    """Diff from the checkout; GitHub's diff API refuses PRs with more than 300 files."""
+    return git(workdir, "diff", "--no-color", "--no-ext-diff", "--no-textconv", base, head)
+
+
+def split_files(diff):
+    """[(path, that file's diff)] in diff order."""
+    out = []
+    for chunk in re.split(r"(?m)^(?=diff --git )", diff):
+        if chunk.startswith("diff --git "):
+            m = re.search(r"(?m)^\+\+\+ b/(.+)$", chunk) or re.match(r"diff --git a/.* b/(.+)", chunk)
+            out.append((m.group(1), chunk))
+    return out
+
+
+def plan_batches(file_diffs):
+    """Pack file diffs into batches of about BATCH_CHARS. Returns (batches, skipped, sampled): lockfiles,
+    binaries and minified files are skipped; in a folder with many changed data files only a sample goes in."""
+    kind = lambda p: (os.path.dirname(p), os.path.splitext(p)[1].lower())
+    bulk = Counter(kind(p) for p, _ in file_diffs if kind(p)[1] in DATA_EXTS)
+    seen, batches, size, skipped, sampled = Counter(), [[]], 0, [], []
+    for path, text in file_diffs:
+        if (os.path.basename(path) in LOCKFILES or path.endswith((".min.js", ".min.css", ".map"))
+                or re.search(r"(?m)^Binary files ", text)):
+            skipped.append(path)
+            continue
+        if bulk[kind(path)] >= BULK_MIN:
+            seen[kind(path)] += 1
+            if seen[kind(path)] > BULK_SAMPLE:
+                sampled.append(path)
+                continue
+        if kind(path)[1] in DATA_EXTS and len(text) > DATA_CHARS:
+            text = text[:DATA_CHARS] + f"\n[diff of {path} cut at {DATA_CHARS} characters; read the file for the rest]\n"
+        for part in split_large(text):
+            if batches[-1] and size + len(part) > BATCH_CHARS:
+                batches.append([])
+                size = 0
+            batches[-1].append((path, part))
+            size += len(part)
+    return [b for b in batches if b], skipped, sampled
+
+
+def split_large(text):
+    """A file diff larger than one batch, split by lines into parts that each repeat the file header."""
+    if len(text) <= BATCH_CHARS:
+        return [text]
+    lines = text.splitlines(keepends=True)
+    head = next((i for i, l in enumerate(lines) if l.startswith("@@")), 0)
+    header, parts, cur = "".join(lines[:head]), [], ""
+    for line in lines[head:]:
+        if cur and len(header) + len(cur) + len(line) > BATCH_CHARS:
+            parts.append(cur)
+            cur = ""
+        cur += line
+    parts.append(cur)
+    return [f"{header}[part {k} of {len(parts)} of this file's diff]\n{c}" for k, c in enumerate(parts, 1)]
+
+
+def lens_prompt(name, paths):
     focus, guides = LENSES[name]
     if name == "correctness":
-        exts = {os.path.splitext(f["path"])[1] for f in files}
+        exts = {os.path.splitext(p)[1] for p in paths}
         guides = guides + sorted({g for e in exts for g in LANGUAGE_GUIDES.get(e, [])})
     text = [f"# Your lens: {name}\n\n{focus}\n\n# Checklists for this lens\n"]
     for g in guides:
@@ -144,28 +218,41 @@ def previous_review(reviews):
     return None
 
 
-def delta_since(repo, prior, head):
+def delta_since(workdir, prior, head):
     """(added lines per path, diff text) since the previous bot review, or None when a full review is due."""
     if not prior:
         return None
     if prior["head"] == head:
         return {}, ""
-    status = gh("api", f"repos/{repo}/compare/{prior['head']}...{head}", "--jq", ".status", check=False)
-    if status.returncode != 0 or status.stdout.strip() != "ahead":
+    ancestor = subprocess.run(["git", "-C", workdir, "merge-base", "--is-ancestor", prior["head"], head],
+                              capture_output=True)
+    if ancestor.returncode != 0:
         return None  # force-push or rebase: anchors are unreliable, review fresh
-    diff = gh("api", "-H", "Accept: application/vnd.github.diff", f"repos/{repo}/compare/{prior['head']}...{head}").stdout
+    diff = local_diff(workdir, prior["head"], head)
     return {p: {n for n, added in lines.items() if added} for p, lines in commentable_lines(diff).items()}, diff
 
 
-def pr_prompt(meta, diff, inline_comments, prior, diff_label="Diff"):
+def batch_note(batches, i, skipped, sampled):
+    """What this call's diff covers, for prompts of a PR split into batches or with files left out."""
+    notes = []
+    if len(batches) > 1:
+        notes.append(f"This PR is too large for one pass, so its diff is split into {len(batches)} batches. "
+                     f"This is batch {i + 1} of {len(batches)}: review the files in the diff below; the full "
+                     "file list is context.")
+    if sampled:
+        notes.append("Data files of the same kind as ones shown in the diff, left out to save space (read any "
+                     "that matter): " + ", ".join(sampled))
+    if skipped:
+        notes.append("Lockfiles, binaries and minified files, not reviewed: " + ", ".join(skipped))
+    return "\n\n".join(notes)
+
+
+def pr_prompt(meta, files, diff, inline_comments, prior, diff_label="Diff", note=""):
     convo = [f"- {c['author']['login']}: {c['body']}" for c in meta.get("comments", [])]
     convo += [f"- {r['author']['login']} (review, {r['state']}): {r['body']}"
               for r in meta.get("reviews", []) if r.get("body") and not re.search(MARKER_RE, r["body"])]
     convo += [f"- {c['user']['login']} on {c['path']}:{c.get('line')}: {c['body']}" for c in inline_comments]
-    files = "\n".join(f"- {f['path']} (+{f['additions']}/-{f['deletions']})" for f in meta["files"])
-    if len(diff) > MAX_DIFF_CHARS:
-        diff = diff[:MAX_DIFF_CHARS] + "\n[diff truncated; use the read tool for the remaining files]"
-    prior_txt = "(none: this is the first review of this PR)"
+    prior_txt = "(none for these files)" if prior else "(none: this is the first review of this PR)"
     if prior and prior["findings"]:
         prior_txt = (f"Previous review was at commit {prior['head'][:7]}. Its findings:\n" +
                      "\n".join(f"- id={f['id']} [{f.get('severity')}] {f.get('title')} — was at {f.get('path')}:{f.get('line')}"
@@ -177,6 +264,7 @@ def pr_prompt(meta, diff, inline_comments, prior, diff_label="Diff"):
         f"Changed files:\n{files}\n\n"
         f"Discussion so far (untrusted):\n{chr(10).join(convo) or '(none)'}\n\n"
         f"Prior review findings:\n{prior_txt}\n\n"
+        + (f"{note}\n\n" if note else "") +
         f"{diff_label}:\n<<<\n{diff}\n>>>\n"
     )
 
@@ -215,12 +303,12 @@ def write_temp(text):
     return fh.name
 
 
-def run_lens(a, name, files, ctx_path, pr_text):
-    lens_path = write_temp(lens_prompt(name, files))
+def run_lens(a, name, paths, ctx_path, pr_text):
+    lens_path = write_temp(lens_prompt(name, paths))
     try:
         out = run_pi(a, [os.path.join(HERE, "prompts", "base.md"), lens_path] + ([ctx_path] if ctx_path else []),
                      pr_text + f"\nReview this PR through the `{name}` lens only. Return only the JSON object.",
-                     timeout=900)
+                     timeout=LENS_TIMEOUT)
         return name, out, None
     except Exception as e:  # one failed lens must not sink the review
         return name, None, str(e)
@@ -255,7 +343,7 @@ def inline_body(f, is_added_line):
 
 
 def render(result, findings, unanchored, prior_status, lens_errors, suppressed, mode, followup, model, elapsed,
-           head_sha):
+           head_sha, calls, skipped, sampled):
     kinds = [k for k, on in (("release review", mode == "release"), ("follow-up", followup)) if on]
     kind = f" ({', '.join(kinds)})" if kinds else ""
     parts = [f"## Code review{kind}: {verdict_of(findings)}"]
@@ -281,12 +369,14 @@ def render(result, findings, unanchored, prior_status, lens_errors, suppressed, 
     if (result.get("testing_notes") or "").strip():
         parts.append(f"**Testing:** {result['testing_notes'].strip()}")
     if lens_errors:
-        parts.append("**Incomplete:** these lenses failed and were skipped: " + ", ".join(lens_errors))
+        parts.append("**Incomplete:** these review calls failed and their part was skipped: " + ", ".join(lens_errors))
+    if skipped or sampled:
+        parts.append(f"<sub>Not reviewed line by line: {len(skipped)} lockfile/binary/minified file(s), "
+                     f"{len(sampled)} data file(s) of the same kind as reviewed samples.</sub>")
     if suppressed:
         parts.append(f"<sub>{suppressed} new minor finding(s) on previously reviewed code were dropped to avoid review loops.</sub>")
     carried = [{k: f.get(k) for k in ("severity", "title", "path", "line")} for f in findings]
     encoded = base64.b64encode(json.dumps(carried, ensure_ascii=False).encode()).decode()
-    calls = "1 follow-up call" if followup else f"{len(LENSES) - len(lens_errors)}/{len(LENSES)} lenses + synthesis"
     parts.append(f"<sub>{model} · Pi · {mode} mode · {calls} · {elapsed:.0f}s · {head_sha[:7]}</sub>\n"
                  f"<!-- {MARKER} head={head_sha} findings={encoded} -->")
     return "\n\n".join(p for p in parts if p)
@@ -350,23 +440,29 @@ def main():
     a = ap.parse_args()
 
     meta = json.loads(gh("pr", "view", str(a.pr), "-R", a.repo, "--json",
-                         "title,body,author,baseRefName,headRefName,headRefOid,files,comments,reviews").stdout)
+                         "title,body,author,baseRefName,headRefName,comments,reviews").stdout)
     inline = json.loads(gh("api", f"repos/{a.repo}/pulls/{a.pr}/comments", "--paginate").stdout)
     raw_reviews = json.loads(gh("api", f"repos/{a.repo}/pulls/{a.pr}/reviews", "--paginate").stdout)
-    diff = gh("pr", "diff", str(a.pr), "-R", a.repo).stdout
+    head = git(a.workdir, "rev-parse", "HEAD").strip()
+    base = git(a.workdir, "merge-base", f"origin/{meta['baseRefName']}", head).strip()
+    files = "\n".join(f"- {p} (+{ad}/-{de})" for ad, de, p in
+                      (row.split("\t", 2) for row in git(a.workdir, "diff", "--numstat", base, head).splitlines()))
+    diff = local_diff(a.workdir, base, head)
     prior = previous_review(raw_reviews)
     rounds = sum(bool(re.search(MARKER_RE, r.get("body") or "")) for r in raw_reviews)
-    # First review of a PR: full lens review. Every later push: one short follow-up call on the delta.
-    follow = delta_since(a.repo, prior, meta["headRefOid"])
+    # First review of a PR: full lens review. Every later push: a short follow-up on the delta.
+    follow = delta_since(a.workdir, prior, head)
     followup = follow is not None
+    delta, review_diff = follow if followup else (None, diff)
+    batches, skipped, sampled = plan_batches(split_files(review_diff))
     mode_note = RELEASE_NOTE if a.mode == "release" else ""
-    if followup:
-        delta, delta_diff = follow
-        pr_text = mode_note + pr_prompt(meta, delta_diff or "(no new commits since the previous review)", inline,
-                                        prior, "Changes since the previous review")
-    else:
-        delta = None
-        pr_text = mode_note + pr_prompt(meta, diff, inline, prior)
+    label = "Changes since the previous review" if followup else "Diff"
+
+    def batch_text(i, prior_part=prior):
+        body = "".join(t for _, t in batches[i]) if batches else "(no new commits since the previous review)"
+        return mode_note + pr_prompt(meta, files, body, inline, prior_part, label,
+                                     batch_note(batches, i, skipped, sampled))
+
     context = base_context(a.repo, meta["baseRefName"])
     ctx_path = write_temp(context) if context else None
 
@@ -374,10 +470,16 @@ def main():
     candidates, lens_errors = [], []
     try:
         if followup:
-            result = run_pi(a, [os.path.join(HERE, "prompts", "followup.md")] + ([ctx_path] if ctx_path else []),
-                            pr_text + "\nDo the follow-up review. Return only the JSON object.", timeout=900)
+            result = followup_review(a, batches, ctx_path, batch_text, prior)
+            calls = f"{max(1, len(batches))} follow-up call(s)"
         else:
-            result, candidates, lens_errors = full_review(a, meta, ctx_path, pr_text)
+            synth_text = batch_text(0) if len(batches) <= 1 else mode_note + pr_prompt(
+                meta, files, f"(not repeated here: the lens reviewers saw it in {len(batches)} batches; "
+                "read the files to verify findings)", inline, prior, label, batch_note([], 0, skipped, sampled))
+            result, candidates, lens_errors = full_review(a, batches, ctx_path, batch_text, synth_text)
+            total = len(LENSES) * max(1, len(batches))
+            calls = f"{total - len(lens_errors)}/{total} lens calls + synthesis" + (
+                f" ({len(batches)} batches)" if len(batches) > 1 else "")
     finally:
         if ctx_path:
             os.unlink(ctx_path)
@@ -411,29 +513,28 @@ def main():
     valid = commentable_lines(diff)
     threads = open_bot_threads(a.repo, a.pr)
     open_titles = {t["title"] for t in threads}
-    anchored, unanchored, skipped = [], [], 0
+    anchored, unanchored, repeated = [], [], 0
     for f in findings:
         line = f.get("line")
         if f.get("title") in open_titles:  # already has an open bot thread; do not repeat it
-            skipped += 1
+            repeated += 1
         elif isinstance(line, int) and line in valid.get(f.get("path"), {}) and len(anchored) < MAX_INLINE:
             anchored.append(f)
         else:
             unanchored.append(f)
 
-    head = meta["headRefOid"]
     review = {
         "commit_id": head,
         "event": "COMMENT",
         "body": render(result, findings, unanchored, prior_status, lens_errors, suppressed, a.mode, followup,
-                       a.model, elapsed, head),
+                       a.model, elapsed, head, calls, skipped, sampled),
         "comments": [{"path": f["path"], "line": f["line"], "side": "RIGHT",
                       "body": inline_body(f, valid[f["path"]][f["line"]])} for f in anchored],
     }
     closed = close_fixed_threads(a.repo, a.pr, prior_status, threads, head, a.dry_run)
     print(json.dumps({"elapsed_s": round(elapsed), "followup": followup, "round": rounds + 1,
                       "candidates": len(candidates), "findings": len(findings),
-                      "inline": len(anchored), "summary_only": len(unanchored), "already_posted": skipped,
+                      "inline": len(anchored), "summary_only": len(unanchored), "already_posted": repeated,
                       "suppressed": suppressed, "threads_resolved": closed, "lens_errors": lens_errors}))
     if a.dry_run:
         print(json.dumps(review, ensure_ascii=False, indent=2))
@@ -443,28 +544,57 @@ def main():
     print("review posted")
 
 
-def full_review(a, meta, ctx_path, pr_text):
-    """Parallel lens reviewers, then one synthesis pass."""
+def full_review(a, batches, ctx_path, batch_text, synth_text):
+    """Every lens on every batch in parallel, then one synthesis pass over all candidates."""
+    tasks = [(name, i) for i in range(max(1, len(batches))) for name in LENSES]
+    paths = lambda i: [p for p, _ in batches[i]] if batches else []
     with ThreadPoolExecutor(max_workers=max(1, a.parallel)) as pool:
-        results = list(pool.map(lambda n: run_lens(a, n, meta["files"], ctx_path, pr_text), LENSES))
+        results = list(pool.map(lambda t: run_lens(a, t[0], paths(t[1]), ctx_path, batch_text(t[1])) + (t[1],), tasks))
     candidates, notes, lens_errors = [], [], []
-    for name, out, err in results:
+    for name, out, err, i in results:
+        where = f"{name} (batch {i + 1}/{len(batches)})" if len(batches) > 1 else name
         if err:
-            lens_errors.append(name)
-            print(f"lens {name} failed: {err}", file=sys.stderr)
+            lens_errors.append(where)
+            print(f"lens {where} failed: {err}", file=sys.stderr)
             continue
-        notes.append(f"- {name}: {out.get('notes', '')}")
+        notes.append(f"- {where}: {out.get('notes', '')}")
         candidates += [dict(f, lens=name) for f in out.get("findings", [])]
-    if len(lens_errors) == len(LENSES):
+    if len(lens_errors) == len(tasks):
         sys.exit("all lenses failed")
-    synthesis_msg = (pr_text + "\nLens notes:\n" + "\n".join(notes) +
+    candidates = [f for f in candidates if f.get("severity") in SEVERITIES[:3]
+                  or (f.get("confidence") or 0) >= MIN_MINOR_CONFIDENCE]
+    synthesis_msg = (synth_text + "\nLens notes:\n" + "\n".join(notes) +
                      "\n\nCandidate findings from the lens reviewers (JSON):\n" +
                      json.dumps(candidates, ensure_ascii=False, indent=1) +
                      "\n\nProduce the final review. Return only the JSON object.")
-    result = run_pi(a, [os.path.join(HERE, "prompts", "synthesis.md")] + ([ctx_path] if ctx_path else []),
-                    synthesis_msg, timeout=900)
+    try:
+        result = run_pi(a, [os.path.join(HERE, "prompts", "synthesis.md")] + ([ctx_path] if ctx_path else []),
+                        synthesis_msg, timeout=min(3600, LENS_TIMEOUT + 20 * len(candidates)))
+    except Exception as e:  # a big PR's lens work must not be lost to one failed call
+        print(f"synthesis failed: {e}", file=sys.stderr)
+        lens_errors.append("synthesis")
+        result = {"summary": "The synthesis pass failed, so the findings below are the lens reviewers' "
+                             "unverified candidates.",
+                  "findings": [dict(f, lenses=[f["lens"]]) for f in candidates]}
     return result, candidates, lens_errors
 
+
+def followup_review(a, batches, ctx_path, batch_text, prior):
+    """One follow-up call per batch of the delta; each earlier finding is re-checked in the batch that touches
+    its file, or in the first batch when no batch does."""
+    paths = [{p for p, _ in b} for b in batches] or [set()]
+    touched = set().union(*paths)
+
+    def call(i):
+        mine = [f for f in prior["findings"] if f.get("path") in paths[i] or (i == 0 and f.get("path") not in touched)]
+        return run_pi(a, [os.path.join(HERE, "prompts", "followup.md")] + ([ctx_path] if ctx_path else []),
+                      batch_text(i, dict(prior, findings=mine)) + "\nDo the follow-up review. Return only the JSON object.",
+                      timeout=LENS_TIMEOUT)
+    with ThreadPoolExecutor(max_workers=max(1, a.parallel)) as pool:
+        parts = list(pool.map(call, range(len(paths))))
+    return {"summary": " ".join((r.get("summary") or "").strip() for r in parts).strip(),
+            "prior_findings": [p for r in parts for p in r.get("prior_findings") or []],
+            "findings": [f for r in parts for f in r.get("findings") or []]}
 
 if __name__ == "__main__":
     main()
