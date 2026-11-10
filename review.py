@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """AI PR review: review a GitHub PR with the Pi coding agent and post the result as one PR review.
 
-Three lens reviewers run in parallel (correctness & contracts, security & performance,
-simplicity & scope), each with checklists from the vendored awesome-skills/code-review-skill.
-A synthesis pass verifies, de-duplicates and writes the final review. Every later push gets one
-short follow-up call instead: earlier findings are re-checked (fixed ones get a reply and their
-thread is resolved) and only serious problems in the new changes are added, so a PR converges.
-The diff comes from the local checkout, so PRs of any size work; a large diff is split into batches
-and every lens (or follow-up call) reviews every batch in one wave of parallel calls. A PR too large for one wave
-gets a broad review instead: code and tests only, each file's diff cut to a fair share, P0-P2 only.
+One agent reviews the PR from three perspectives (correctness & contracts, security & performance,
+simplicity & scope), reads code and checklists from the vendored awesome-skills/code-review-skill as it
+needs them, verifies its own findings and writes the review. Every later push gets one short follow-up
+call instead: earlier findings are re-checked (fixed ones get a reply and their thread is resolved) and
+only serious problems in the new changes are added, so a PR converges. The diff comes from the local
+checkout, so PRs of any size work; a PR larger than one batch gets a broad review: code and tests only,
+each file's diff cut to a fair share or shown as an outline, P0-P2 only.
 
 Usage: review.py --repo owner/name --pr N --workdir <checkout at PR head>
-                 [--mode feature|release] [--model zai/glm-5.3-flash] [--thinking high] [--parallel 3]
+                 [--mode feature|release] [--model zai/glm-5.3-flash] [--thinking medium] [--parallel 1]
                  [--batch-chars 120000] [--time-budget 15] [--pi pi] [--dry-run]
-The time budget (minutes) caps the whole review: lens calls get the first two thirds, the synthesis the rest;
-a call still running at its deadline is stopped and the review is posted with what finished.
+The time budget (minutes) caps the whole review: two minutes before the end the agent is told to stop
+exploring and answer, at the end it is stopped. Pi runs in RPC mode, so the job log shows every tool call,
+provider retry (e.g. HTTP 429) and the tokens used.
 Feature mode reviews one change in depth; release mode (e.g. staging -> main) looks at the combined effect.
 Needs: gh (authenticated via GH_TOKEN), pi, and the model provider's API key in the environment (e.g. ZAI_API_KEY).
 Project rules come from CLAUDE.md / AGENTS.md / .github/ai-review.md on the BASE branch.
@@ -24,10 +24,12 @@ import base64
 import itertools
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -44,13 +46,15 @@ DATA_EXTS = {".json", ".csv", ".tsv", ".xml", ".svg", ".txt", ".geojson"}
 DOC_EXTS = {".md", ".mdx", ".rst", ".css", ".scss", ".less"}
 BULK_MIN, BULK_SAMPLE = 10, 2  # a folder with >= 10 changed data files of one type: 2 go in the diff, the rest are listed
 MAX_INLINE = 25
-LENS_TIMEOUT = 1200  # seconds per Pi call
+CALL_TIMEOUT = 1800  # seconds per Pi call when there is no time budget
+STEER_LEAD = 120  # seconds before the deadline the agent is told to answer
+STEER = "Time is up. Do not call any more tools. Return the JSON object now with the findings you have verified."
 BROAD_MIN_SHARE = 3000  # below this share per file, a broad review shows outlines instead of cut diffs
 BROAD_NOTE = (
     "LARGE PR, BROAD REVIEW: this PR is too large to read line by line in the time available. The diff below "
     "has code and tests only, each file's diff is cut short or shown as an outline (its top-level added lines), "
     "and the other files are only listed. Look at the "
-    "change broadly through your lens: architecture and layering, contracts between the changed parts (API, "
+    "change broadly: architecture and layering, contracts between the changed parts (API, "
     "data, schema, migrations), security-sensitive paths, error-handling patterns, risky dependencies and "
     "config. Open at most 5 files, the ones that look riskiest. Skip local style and minor issues; report "
     "P0-P2 only.\n\n")
@@ -59,7 +63,7 @@ PRIOR_STATUS_LABEL = {"resolved": "fixed", "still_open": "still open", "deferred
                       "obsolete": "no longer applies", "rejected": "not a defect"}
 MIN_MINOR_CONFIDENCE = 0.7  # P3/nit below this are dropped
 
-LENSES = {
+PERSPECTIVES = {
     "correctness": (
         "Correctness, contracts and tests: logic errors, edge cases, off-by-one, null/empty handling, error "
         "handling, panics/exceptions, state and lifecycle, concurrency and locking; API/wire compatibility, "
@@ -94,7 +98,7 @@ LENSES = {
 }
 RELEASE_NOTE = (
     "RELEASE REVIEW: this PR promotes features that were already reviewed one by one (e.g. staging -> main). "
-    "Do not re-review individual lines in depth. Look at the combined effect through your lens: interactions "
+    "Do not re-review individual lines in depth. Look at the combined effect: interactions "
     "between the features, migrations and data, config/env changes, deploy and rollback risk, breaking API "
     "changes for clients (web, mobile), leftover debug code or half-finished work. Report P0-P2 only.\n\n")
 LANGUAGE_GUIDES = {".rs": ["rust.md"], ".ts": ["typescript.md"], ".tsx": ["typescript.md", "react.md"],
@@ -117,7 +121,7 @@ def tracked(total):
         start, ok = time.time(), False
         try:
             out = fn()
-            ok = not (isinstance(out, tuple) and out[2])  # run_lens reports its error instead of raising
+            ok = True
             return out
         finally:
             log(f"{where}: {'done' if ok else 'failed'} in {time.time() - start:.0f}s ({next(done)}/{total})")
@@ -263,17 +267,15 @@ def split_large(text, limit):
     return [f"{header}[part {k} of {len(parts)} of this file's diff]\n{c}" for k, c in enumerate(parts, 1)]
 
 
-def lens_prompt(name, paths, checklists=True):
-    focus, guides = LENSES[name]
-    if not checklists:
-        return f"# Your lens: {name}\n\n{focus}"
-    if name == "correctness":
-        exts = {os.path.splitext(p)[1] for p in paths}
-        guides = guides + sorted({g for e in exts for g in LANGUAGE_GUIDES.get(e, [])})
-    text = [f"# Your lens: {name}\n\n{focus}\n\n# Checklists for this lens\n"]
-    for g in guides:
-        with open(os.path.join(GUIDES, g), encoding="utf-8") as fh:
-            text.append(f"## {g}\n\n{fh.read()}")
+def perspectives_prompt(paths):
+    """The three review perspectives, each with the checklists the agent may read when they help it decide."""
+    exts = {os.path.splitext(p)[1] for p in paths}
+    text = ["# Three perspectives\n\nReview the PR from all three. Checklists are listed as files you may read with "
+            "the read tool when one would help you decide; do not read them all."]
+    for name, (focus, guides) in PERSPECTIVES.items():
+        if name == "correctness":
+            guides = guides + sorted({g for e in exts for g in LANGUAGE_GUIDES.get(e, [])})
+        text.append(f"## {name}\n\n{focus}\n\nChecklists: " + ", ".join(os.path.join(GUIDES, g) for g in guides))
     return "\n\n".join(text)
 
 
@@ -368,55 +370,86 @@ def extract_json(text):
     return json.loads(text[start : end + 1])
 
 
-def pi_call(cmd, message, cwd, until):
-    """Run Pi until the deadline `until` (epoch seconds) at the latest."""
-    timeout = min(until, time.time() + LENS_TIMEOUT) - time.time()
-    if timeout < 30:
+def run_pi(a, prompt_files, message, until, where, tools=True):
+    """One Pi agent run in RPC mode, logging each tool call and provider retry; returns the parsed JSON answer.
+    STEER_LEAD seconds before `until` the agent is told to answer now; at `until` it is stopped."""
+    until = min(until, time.time() + CALL_TIMEOUT)
+    if until - time.time() < 30:
         raise RuntimeError("no time left in the time budget")
-    try:
-        return subprocess.run(cmd, input=message, cwd=cwd, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"stopped after {timeout / 60:.0f} min (time budget)") from None
-
-
-def run_pi(a, prompt_files, message, until):
-    """One Pi call with read-only tools; returns parsed JSON."""
-    cmd = [a.pi, "-p", "--no-session", "--offline", "--model", a.model, "--thinking", a.thinking,
-           "--tools", "read,grep,find,ls", "--no-extensions", "--no-skills",
-           "--no-prompt-templates", "--no-context-files", "--no-mcp"]
+    cmd = [a.pi, "--mode", "rpc", "--no-session", "--offline", "--model", a.model,
+           "--thinking", a.thinking if tools else "off", *(["--tools", "read,grep,find,ls"] if tools else ["--no-tools"]),
+           "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-mcp"]
     for f in prompt_files:
         cmd += ["--append-system-prompt", f]
-    run = pi_call(cmd, message, a.workdir, until)
-    if run.returncode != 0:
-        raise RuntimeError(f"pi exited {run.returncode}: {run.stderr.strip()[-500:]}")
+    stats, text, error, steered = Counter(), "", None, False
+    with tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err, cwd=a.workdir)
+        events = queue.Queue()
+        threading.Thread(target=lambda: [events.put(line) for line in proc.stdout] + [events.put(None)],
+                         daemon=True).start()
+
+        def send(record):
+            proc.stdin.write(json.dumps(record).encode() + b"\n")
+            proc.stdin.flush()
+        try:
+            send({"type": "prompt", "message": message})
+            while True:
+                left = until - time.time()
+                if left <= 0:
+                    raise RuntimeError(f"stopped at the time budget after {stats['turns']} turns")
+                if tools and not steered and left <= STEER_LEAD:
+                    send({"type": "steer", "message": STEER})
+                    steered = a.cut_short = True
+                    log(f"{where}: time is nearly up, asked for the answer")
+                try:
+                    line = events.get(timeout=min(5, left))
+                except queue.Empty:
+                    continue
+                if line is None:
+                    err.seek(0)
+                    raise RuntimeError(f"pi exited {proc.wait()}: {err.read().decode(errors='replace').strip()[-500:]}")
+                e = json.loads(line)
+                kind = e.get("type")
+                if kind == "response" and not e.get("success"):
+                    raise RuntimeError(f"pi refused {e.get('command')}: {e.get('error')}")
+                if kind == "turn_end":
+                    stats["turns"] += 1
+                elif kind == "tool_execution_start":
+                    stats["tools"] += 1
+                    args = e.get("args") or {}
+                    log(f"{where}: {e.get('toolName')} {args.get('path') or args.get('pattern') or ''}".rstrip())
+                elif kind == "auto_retry_start":
+                    stats["retries"] += 1
+                    log(f"{where}: provider error, retry {e.get('attempt')} in {e.get('delayMs', 0) / 1000:.0f}s: "
+                        f"{(e.get('errorMessage') or '')[:160]}")
+                elif kind == "message_end" and e["message"].get("role") == "assistant":
+                    m = e["message"]
+                    stats["tokens"] += (m.get("usage") or {}).get("input", 0)
+                    error = m.get("errorMessage") if m.get("stopReason") == "error" else None
+                    text = "".join(c.get("text", "") for c in m.get("content", []) if c.get("type") == "text") or text
+                elif kind == "agent_settled":
+                    break
+        finally:
+            proc.kill()
+            proc.wait()
+    if tools:
+        log(f"{where}: {stats['turns']} turns, {stats['tools']} tool calls, {stats['retries']} provider retries, "
+            f"{stats['tokens'] // 1000}k input tokens")
+    if error and not text:
+        raise RuntimeError(error)
     try:
-        return extract_json(run.stdout)
+        return extract_json(text)
     except ValueError:  # usually one unescaped quote; a cheap no-tools pass repairs it
-        fix = pi_call([a.pi, "-p", "--no-session", "--offline", "--model", a.model, "--thinking", "off",
-                       "--no-tools", "--no-extensions", "--no-skills", "--no-prompt-templates",
-                       "--no-context-files", "--no-mcp"],
-                      "Repair this into valid JSON with the same content. Return only the JSON.\n\n" + run.stdout,
-                      a.workdir, min(until, time.time() + 300))
-        return extract_json(fix.stdout)
+        if not tools:
+            raise
+        return run_pi(a, [], "Repair this into valid JSON with the same content. Return only the JSON.\n\n" + text,
+                      max(until, time.time() + 120), where, tools=False)
 
 
 def write_temp(text):
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as fh:
         fh.write(text)
     return fh.name
-
-
-def run_lens(a, name, paths, ctx_path, pr_text):
-    lens_path = write_temp(lens_prompt(name, paths, checklists=not a.broad))
-    try:
-        out = run_pi(a, [os.path.join(HERE, "prompts", "base.md"), lens_path] + ([ctx_path] if ctx_path else []),
-                     pr_text + f"\nReview this PR through the `{name}` lens only. Return only the JSON object.",
-                     a.lens_until)
-        return name, out, None
-    except Exception as e:  # one failed lens must not sink the review
-        return name, None, str(e)
-    finally:
-        os.unlink(lens_path)
 
 
 def verdict_of(findings):
@@ -445,8 +478,8 @@ def inline_body(f, is_added_line):
     return body
 
 
-def render(result, findings, unanchored, prior_status, lens_errors, suppressed, mode, followup, model, elapsed,
-           head_sha, calls, skipped, sampled, broad):
+def render(result, findings, unanchored, prior_status, errors, cut_short, suppressed, mode, followup, model,
+           elapsed, head_sha, calls, skipped, sampled, broad):
     kinds = [k for k, on in (("release review", mode == "release"), ("broad review of a large PR", broad),
                              ("follow-up", followup)) if on]
     kind = f" ({', '.join(kinds)})" if kinds else ""
@@ -474,11 +507,13 @@ def render(result, findings, unanchored, prior_status, lens_errors, suppressed, 
         parts.append(f"**Testing:** {result['testing_notes'].strip()}")
     if (result.get("context_notes") or "").strip():
         parts.append(f"**Project rulebook (CLAUDE.md):** {result['context_notes'].strip()}")
-    if lens_errors:
-        parts.append("**Incomplete:** these review calls failed or ran out of time and their part was skipped: " + ", ".join(lens_errors))
+    if errors:
+        parts.append("**Incomplete:** these review calls failed and their part was skipped: " + ", ".join(errors))
+    if cut_short:
+        parts.append("<sub>The review reached its time budget, so it was asked to finish with what it had verified.</sub>")
     if skipped or sampled:
         parts.append(f"<sub>Not reviewed line by line: {len(skipped)} lockfile/binary/minified file(s), "
-                     f"{len(sampled)} file(s) only listed for the reviewers to open as needed.</sub>")
+                     f"{len(sampled)} file(s) only listed for the reviewer to open as needed.</sub>")
     if suppressed:
         parts.append(f"<sub>{suppressed} new minor finding(s) on previously reviewed code were dropped to avoid review loops.</sub>")
     carried = [{k: f.get(k) for k in ("severity", "title", "path", "line")} for f in findings]
@@ -538,8 +573,8 @@ def main():
     ap.add_argument("--pr", required=True, type=int)
     ap.add_argument("--workdir", required=True)
     ap.add_argument("--model", default="zai/glm-5.3-flash")
-    ap.add_argument("--thinking", default="high")
-    ap.add_argument("--parallel", type=int, default=len(LENSES))
+    ap.add_argument("--thinking", default="medium")
+    ap.add_argument("--parallel", type=int, default=1, help="follow-up calls at once")
     ap.add_argument("--batch-chars", type=int, default=120_000)
     ap.add_argument("--time-budget", type=float, default=15, help="minutes for the whole review; 0 = no limit")
     ap.add_argument("--mode", choices=["feature", "release"], default="feature")
@@ -548,7 +583,7 @@ def main():
     a = ap.parse_args()
     budget = a.time_budget * 60 or float("inf")
     a.until = time.time() + budget - 30  # leaves time to post the review
-    a.lens_until = a.until - budget / 3  # the rest is for the synthesis
+    a.errors, a.cut_short = [], False
 
     meta = json.loads(gh("pr", "view", str(a.pr), "-R", a.repo, "--json",
                          "title,body,author,baseRefName,headRefName,comments,reviews").stdout)
@@ -561,20 +596,20 @@ def main():
     diff = local_diff(a.workdir, base, head)
     prior = previous_review(raw_reviews)
     rounds = sum(bool(re.search(MARKER_RE, r.get("body") or "")) for r in raw_reviews)
-    # First review of a PR: full lens review. Every later push: a short follow-up on the delta.
+    # First review of a PR: full review. Every later push: a short follow-up on the delta.
     follow = delta_since(a.workdir, prior, head)
     followup = follow is not None
     delta, review_diff = follow if followup else (None, diff)
-    # A PR whose batches do not fit in one wave of parallel calls gets one broad pass instead of a detailed one.
+    # A PR whose batches do not fit in one wave of calls gets one broad pass instead of a detailed one.
     file_diffs = split_files(review_diff)
-    wave = max(1, a.parallel // (1 if followup else len(LENSES)))
+    wave = max(1, a.parallel) if followup else 1
     batches, skipped, sampled = plan_batches(file_diffs, a.batch_chars)
-    broad = a.broad = len(batches) > wave
+    broad = len(batches) > wave
     if broad:
         batches, skipped, sampled = plan_batches(file_diffs, a.batch_chars, wave)
     log(f"{'follow-up' if followup else 'full'} {a.mode} review{' (broad)' if broad else ''}: {len(batches)} "
         f"batch(es) of the diff, {len(skipped)} skipped and {len(sampled)} listed file(s), {a.model}, "
-        f"{a.parallel} call(s) at a time")
+        f"thinking {a.thinking}, {a.time_budget:g}-minute budget")
     mode_note = (RELEASE_NOTE if a.mode == "release" else "") + (BROAD_NOTE if broad else "")
     label = "Changes since the previous review" if followup else "Diff"
 
@@ -587,22 +622,15 @@ def main():
     ctx_path = write_temp(context) if context else None
 
     started = time.time()
-    candidates, lens_errors = [], []
     try:
         if followup:
             result = followup_review(a, batches, ctx_path, batch_text, prior)
             calls = f"{max(1, len(batches))} follow-up call(s)"
         else:
-            synth_text = batch_text(0) if len(batches) <= 1 else mode_note + pr_prompt(
-                meta, files, f"(not repeated here: the lens reviewers saw it in {len(batches)} batches; "
-                "read the files to verify findings)", inline, prior, label, batch_note([], 0, skipped, sampled))
-            if not context:
-                synth_text += (f"\nProject context: none (no {', '.join(CONTEXT_FILES)} on "
-                               f"`{meta['baseRefName']}`).\n")
-            result, candidates, lens_errors = full_review(a, batches, ctx_path, batch_text, synth_text)
-            total = len(LENSES) * max(1, len(batches))
-            calls = f"{total - len(set(lens_errors) - {'synthesis'})}/{total} lens calls + synthesis" + (
-                f" ({len(batches)} batches)" if len(batches) > 1 else "")
+            no_rules = "" if context else (f"\nProject context: none (no {', '.join(CONTEXT_FILES)} on "
+                                           f"`{meta['baseRefName']}`).\n")
+            result = full_review(a, batches, ctx_path, batch_text(0) + no_rules)
+            calls = "1 review call"
     finally:
         if ctx_path:
             os.unlink(ctx_path)
@@ -649,16 +677,17 @@ def main():
     review = {
         "commit_id": head,
         "event": "COMMENT",
-        "body": render(result, findings, unanchored, prior_status, lens_errors, suppressed, a.mode, followup,
-                       a.model, elapsed, head, calls, skipped, sampled, broad),
+        "body": render(result, findings, unanchored, prior_status, a.errors, a.cut_short, suppressed, a.mode,
+                       followup, a.model, elapsed, head, calls, skipped, sampled, broad),
         "comments": [{"path": f["path"], "line": f["line"], "side": "RIGHT",
                       "body": inline_body(f, valid[f["path"]][f["line"]])} for f in anchored],
     }
     closed = close_fixed_threads(a.repo, a.pr, prior_status, threads, head, a.dry_run)
     print(json.dumps({"elapsed_s": round(elapsed), "followup": followup, "round": rounds + 1,
-                      "candidates": len(candidates), "findings": len(findings),
+                      "findings": len(findings),
                       "inline": len(anchored), "summary_only": len(unanchored), "already_posted": repeated,
-                      "suppressed": suppressed, "threads_resolved": closed, "lens_errors": lens_errors}))
+                      "suppressed": suppressed, "threads_resolved": closed, "errors": a.errors,
+                      "cut_short": a.cut_short}))
     if a.dry_run:
         print(json.dumps(review, ensure_ascii=False, indent=2))
         return
@@ -667,43 +696,15 @@ def main():
     print("review posted")
 
 
-def full_review(a, batches, ctx_path, batch_text, synth_text):
-    """Every lens on every batch in parallel, then one synthesis pass over all candidates."""
-    tasks = [(name, i) for i in range(max(1, len(batches))) for name in LENSES]
-    paths = lambda i: [p for p, _ in batches[i]] if batches else []
-    label = lambda name, i: f"{name} (batch {i + 1}/{len(batches)})" if len(batches) > 1 else name
-    track = tracked(len(tasks))
-    with ThreadPoolExecutor(max_workers=max(1, a.parallel)) as pool:
-        results = list(pool.map(lambda t: track(label(*t), lambda: run_lens(
-            a, t[0], paths(t[1]), ctx_path, batch_text(t[1]))) + (t[1],), tasks))
-    candidates, notes, lens_errors = [], [], []
-    for name, out, err, i in results:
-        where = label(name, i)
-        if err:
-            lens_errors.append(where)
-            print(f"lens {where} failed: {err}", file=sys.stderr)
-            continue
-        notes.append(f"- {where}: {out.get('notes', '')}")
-        candidates += [dict(f, lens=name) for f in out.get("findings", [])]
-    if len(lens_errors) == len(tasks):
-        sys.exit("all lenses failed")
-    candidates = [f for f in candidates if f.get("severity") in SEVERITIES[:3]
-                  or (f.get("confidence") or 0) >= MIN_MINOR_CONFIDENCE]
-    synthesis_msg = (synth_text + "\nLens notes:\n" + "\n".join(notes) +
-                     "\n\nCandidate findings from the lens reviewers (JSON):\n" +
-                     json.dumps(candidates, ensure_ascii=False, indent=1) +
-                     "\n\nProduce the final review. Return only the JSON object.")
+def full_review(a, batches, ctx_path, pr_text):
+    """One agent reviews the PR from the three perspectives and verifies its own findings."""
+    persp = write_temp(perspectives_prompt([p for b in batches for p, _ in b]))
     try:
-        result = tracked(1)(f"synthesis of {len(candidates)} candidate(s)", lambda: run_pi(
-            a, [os.path.join(HERE, "prompts", "synthesis.md")] + ([ctx_path] if ctx_path else []),
-            synthesis_msg, a.until))
-    except Exception as e:  # a big PR's lens work must not be lost to one failed call
-        print(f"synthesis failed: {e}", file=sys.stderr)
-        lens_errors.append("synthesis")
-        result = {"summary": "The synthesis pass failed, so the findings below are the lens reviewers' "
-                             "unverified candidates.",
-                  "findings": [dict(f, lenses=[f["lens"]]) for f in candidates]}
-    return result, candidates, lens_errors
+        prompts = [os.path.join(HERE, "prompts", "review.md"), persp] + ([ctx_path] if ctx_path else [])
+        return tracked(1)("review", lambda: run_pi(
+            a, prompts, pr_text + "\nReview this PR. Return only the JSON object.", a.until, "review"))
+    finally:
+        os.unlink(persp)
 
 
 def followup_review(a, batches, ctx_path, batch_text, prior):
@@ -715,13 +716,15 @@ def followup_review(a, batches, ctx_path, batch_text, prior):
 
     def call(i):
         mine = [f for f in prior["findings"] if f.get("path") in paths[i] or (i == 0 and f.get("path") not in touched)]
+        where = f"follow-up (batch {i + 1}/{len(paths)})"
         try:
-            return track(f"follow-up (batch {i + 1}/{len(paths)})", lambda: run_pi(
+            return track(where, lambda: run_pi(
                 a, [os.path.join(HERE, "prompts", "followup.md")] + ([ctx_path] if ctx_path else []),
                 batch_text(i, dict(prior, findings=mine)) + "\nDo the follow-up review. Return only the JSON object.",
-                a.until))
+                a.until, where))
         except Exception as e:  # its earlier findings then count as still open
-            log(f"follow-up (batch {i + 1}/{len(paths)}) failed: {e}")
+            log(f"{where} failed: {e}")
+            a.errors.append(where)
             return {}
     with ThreadPoolExecutor(max_workers=max(1, a.parallel)) as pool:
         parts = list(pool.map(call, range(len(paths))))
