@@ -1,7 +1,9 @@
 # ai-review
 
-Automatic pull request review with the GLM Coding Plan (Pi + `zai/glm-5.3`), plus a deterministic secret scan.
-Everything runs on the self-hosted runner `s10-review` (a phone at home), so every GLM request leaves from the home IP.
+Automatic pull request review with the [Pi](https://github.com/badlogic/pi-mono) coding agent and any model Pi
+supports (default `zai/glm-5.3` on the GLM Coding Plan), plus a deterministic secret scan.
+It runs on a self-hosted GitHub Actions runner on any Linux machine (x64 or arm64), so the model API key stays on that
+machine and every model request leaves from its IP.
 
 ## What runs on a PR
 | Job | What it does | Fails the check? |
@@ -29,6 +31,8 @@ review runs and removes the label, so you can add it again later.
    fixed / still open / deferred / no longer applies / not a defect; the bot replies "Fixed in <sha>" on its own threads and
    resolves them. New findings must be P0-P2 on newly changed lines (P0 anywhere); from the 4th review on, only P0/P1.
    When nothing is left it says "No new comments", so a PR converges instead of looping.
+   The first review also gives feedback on the project rulebook: with no `CLAUDE.md` / `AGENTS.md` it asks for one and
+   lists what it should state; when the PR makes the rulebook outdated it says what to update.
 4. The review has a plain header (`Code review: Changes requested | Worth a look | Looks good`; only P0/P1 count as
    changes requested), inline comments (max 25, `suggestion` blocks for one-line fixes or deletions), severity, confidence
    and lenses per finding, and the model in the footer. P3/nit findings below 0.7 confidence are dropped.
@@ -36,8 +40,9 @@ review runs and removes the label, so you can add it again later.
    Comments added in the diff that restate code, tell history, leak chat/task context or read like notes to an AI are flagged.
 
 It always writes in English and never approves or blocks in GitHub's review state (always `COMMENT`).
-Cost on the Pro plan: about 150 credits and 3-4 minutes for the first review of a small PR, about 10 credits and
-under a minute for a follow-up.
+Cost on the GLM Coding Plan Pro: about 150 credits and 3-4 minutes for the first review of a small PR, about 10
+credits and under a minute for a follow-up. The job log shows each review call as it starts and finishes, with how many
+are done and an estimate of the time left.
 
 ## Large PRs
 Every changed file is reviewed. When the diff is larger than about 120k characters it is split into batches by file
@@ -46,7 +51,9 @@ candidates. Follow-ups are batched the same way. Exceptions, listed in the revie
 minified files are skipped; data files (`.json`, `.csv`, `.svg`, ...) are cut at 30k characters, and when one folder
 has 10 or more changed data files of one type only 2 go into the diff and the rest are listed for the reviewer to read.
 A PR with a 450k-character diff takes 4 batches (12 lens calls); one with 400+ files and 4.6M characters, mostly
-data, about 19 batches (57 calls) and can run for a few hours with 3 calls in parallel.
+data, about 19 batches (57 calls) and can run for a few hours with 3 calls in parallel. Nearly all of that time is
+spent waiting for the model; `parallel` and `batch_chars` are the settings that change it. One runner reviews one PR
+at a time, so other PRs wait in the queue meanwhile; register a second runner on the machine to review two at once.
 
 ## Two review modes
 The mode is picked from the PR's head branch (`release_from` input, default `staging`):
@@ -64,11 +71,38 @@ The mode is picked from the PR's head branch (`release_from` input, default `sta
 | `prompts/synthesis.md` | Lead reviewer instructions and final output contract |
 | `prompts/followup.md` | Follow-up review instructions for later pushes |
 | `vendor/code-review-skill/` | Checklists from [awesome-skills/code-review-skill](https://github.com/awesome-skills/code-review-skill) (MIT, pinned commit in `SOURCE.md`) |
-| `run.sh` | Runner entrypoint: loads the GLM key and calls `review.py` |
+| `run.sh` | Runner entrypoint: loads the API key file and calls `review.py` |
+| `update-pi.sh` | Installs or updates Pi to its latest release; runs at the start of every review job |
+| `install.sh` | Sets up a self-hosted runner for ai-review on a Linux machine |
 | `.github/workflows/review.yml` | Reusable workflow (`secrets` + `review` jobs) called by projects |
 
+## Install on a Linux machine
+Needs a Linux machine (x64 or arm64) with systemd, `sudo`, `git`, `curl`, `python3` (3.9+) and
+[`gh`](https://cli.github.com) logged in as an admin of the repository. The machine only makes outgoing connections.
+
+```sh
+git clone https://github.com/tyfnacici/ai-review.git && cd ai-review
+./install.sh <owner>/<repo>          # or ./install.sh <org> for every repository of an organization
+```
+
+The script creates a system user `ai-review` (home `/opt/ai-review`, no sudo), installs the latest Pi, clones this
+repository, and registers and starts a runner with the label `ai-review`. Then put the API key of your model provider
+into `/opt/ai-review/.config/ai-review/env` (mode 600; it never goes to GitHub), for example:
+
+```sh
+sudo -u ai-review nano /opt/ai-review/.config/ai-review/env
+# ZAI_API_KEY=...          for zai/... models
+# ANTHROPIC_API_KEY=...    for anthropic/... models
+```
+
+`pi --help` lists every provider and its variable. Overrides: `LABEL`, `RUNNER_NAME`, `KEY_FILE` (an env file to
+install), `AI_REVIEW_URL` (your fork), `RUNNER_USER`, `RUNNER_HOME`. Run it again for another repository; the user,
+Pi and key are shared. Pi updates itself at the start of every review job (the previous version stays in `~/pi.old`),
+the runner updates itself, and the reviewer code is synced from `main` before every job. gitleaks stays pinned to a
+checked version on purpose.
+
 ## Adding it to a project
-1. Register an `s10-review` runner for that repo on s10 under `/opt/gha-review/runners/<repo>`.
+1. Install a runner for the repository (above).
 2. Add `<project>/.github/workflows/ai-review.yml`:
    ```yaml
    name: AI review
@@ -85,20 +119,25 @@ The mode is picked from the PR's head branch (`release_from` input, default `sta
    jobs:
      review:
        uses: tyfnacici/ai-review/.github/workflows/review.yml@main
+       with:
+         runs_on: '["self-hosted", "ai-review"]'
+         model: zai/glm-5.3
    ```
 3. Create the label once: `gh label create ai-review -R <owner>/<repo> --description "Run the AI review again"`.
 4. Keep the project's `CLAUDE.md` up to date; it is the review rulebook.
 5. Turn on Dependabot alerts for the repo (alerts only; no automatic PRs needed).
 
-## Settings (runner environment)
-| Variable | Default | Meaning |
+## Settings (workflow inputs)
+| Input | Default | Meaning |
 |---|---|---|
-| `model` (workflow input) | `zai/glm-5.3` | Pi model spec |
-| `THINKING` | `high` | Pi thinking level |
-| `PARALLEL` | `3` | Lens calls running at once |
+| `runs_on` | `["self-hosted", "s10-review"]` | Runner labels (JSON list) |
+| `model` | `zai/glm-5.3` | Pi model spec (`provider/model`) |
+| `thinking` | `high` | Pi thinking level (`off` ... `max`); lower is faster |
+| `parallel` | `3` | Review calls running at once; raise it if your provider's rate limit allows |
+| `batch_chars` | `120000` | Diff characters per review call; larger diffs are split into batches |
+| `release_from` | `staging` | Head branch that gets a release review |
+| `trigger_label` | `ai-review` | Label that runs the review again |
 
-## s10 side
-- User `gha-review` (system user, no docker/sudo), home `/opt/gha-review`.
-- GLM Coding Plan key in `/opt/gha-review/.config/glm/zai.env` (mode 600). It never goes to GitHub.
-- This repo is cloned at `/opt/gha-review/ai-review` with a read-only deploy key and synced at the start of every job.
-- gitleaks is downloaded once (pinned version, SHA-256 checked) to `/opt/gha-review/bin`.
+## Original setup
+The defaults match the author's runner `s10-review`: user `gha-review` with home `/opt/gha-review`, the key in
+`~/.config/glm/zai.env` (still read by `run.sh`), and this repository cloned with a read-only deploy key.
