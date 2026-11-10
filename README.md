@@ -10,6 +10,7 @@ machine and every model request leaves from its IP.
 |---|---|---|
 | `secrets` | every push: [gitleaks](https://github.com/gitleaks/gitleaks) scans the lines the PR adds (values redacted in the log) | yes, on a leak |
 | `dependencies` | every push: [osv-scanner](https://github.com/google/osv-scanner) scans the lockfiles the PR changes at the base and at the head and reports only the vulnerabilities the PR adds (`package-lock.json`, `Cargo.lock`, `yarn.lock`, `pnpm-lock.yaml`, `poetry.lock`, `uv.lock`, `Pipfile.lock`, `Gemfile.lock`, `composer.lock`, `go.mod`) | yes, on a new HIGH or CRITICAL one |
+| `gate` | after every review and whenever a review thread is resolved or reopened: red while the bot has unresolved threads on the PR, green when all are resolved | yes, while threads are open |
 | `review` | when the PR is opened / marked ready, and again each time you add the `ai-review` label: AI review posted as one PR review by `github-actions[bot]` | no, advisory only |
 
 Pushes do not trigger the AI review. When you are done with the fixes, add the `ai-review` label to the PR; the
@@ -44,7 +45,10 @@ review runs and removes the label, so you can add it again later.
 5. Fixes must be minimal, keep the build and tests green, and never add abstractions, dependencies or refactors.
    Comments added in the diff that restate code, tell history, leak chat/task context or read like notes to an AI are flagged.
 
-It always writes in English and never approves or blocks in GitHub's review state (always `COMMENT`).
+It always writes in English. The review is a `COMMENT`, except when nothing is left: no finding and none of its own
+threads unresolved. Then it is an `APPROVE`. Approving needs the repository setting *Actions > General > Allow GitHub
+Actions to create and approve pull requests*; without it the review falls back to a comment (the log says so). It never
+requests changes.
 The job log shows what the agent is doing as it happens: every file it reads or searches, every provider retry
 (for example HTTP 429 "Too much concurrency" from the GLM Coding Plan), and per call the turns, tool calls and tokens.
 
@@ -78,7 +82,7 @@ The mode is picked from the PR's head branch (`release_from` input, default `sta
 ## Files
 | File | Purpose |
 |---|---|
-| `review.py` | Orchestration: PR data, the review or follow-up agent run (Pi RPC mode), posting, thread resolution |
+| `review.py` | Orchestration: PR data, the review or follow-up agent run (Pi RPC mode), posting, thread resolution; `--gate` only lists the unresolved threads |
 | `prompts/review.md` | Reviewer instructions and output contract |
 | `prompts/followup.md` | Follow-up review instructions for later pushes |
 | `vendor/code-review-skill/` | Checklists from [awesome-skills/code-review-skill](https://github.com/awesome-skills/code-review-skill) (MIT, pinned commit in `SOURCE.md`) |
@@ -121,6 +125,8 @@ the runner updates itself, and the reviewer code is synced from `main` before ev
      pull_request:
        branches: [main, staging]
        types: [opened, synchronize, reopened, ready_for_review, labeled]
+     pull_request_review_thread:
+       types: [resolved, unresolved]
    concurrency:
      group: ai-review-${{ github.event.pull_request.number }}-${{ github.event.action }}-${{ github.event.label.name }}
      cancel-in-progress: true
@@ -137,7 +143,10 @@ the runner updates itself, and the reviewer code is synced from `main` before ev
    ```
 3. Create the label once: `gh label create ai-review -R <owner>/<repo> --description "Run the AI review again"`.
 4. Keep the project's `CLAUDE.md` up to date; it is the review rulebook.
-5. Turn on Dependabot alerts for the repo (alerts only; no automatic PRs needed). The `dependencies` job needs nothing else.
+5. To make the merge button wait for the gate (needs GitHub Pro for a private repository, or a public one): in the
+   branch protection of `main` require the `review / gate` status check and turn on *Require conversation resolution
+   before merging*. Without branch protection the gate is red or green on the PR, but nothing blocks the merge.
+6. Turn on Dependabot alerts for the repo (alerts only; no automatic PRs needed). The `dependencies` job needs nothing else.
 
 ## Settings (workflow inputs)
 | Input | Default | Meaning |
