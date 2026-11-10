@@ -135,6 +135,28 @@ def gh(*args, input_text=None, check=True):
     return out
 
 
+def dependabot_summary(repo, changed):
+    """One line on the repository's open Dependabot alerts; empty when they cannot be read (no permission, disabled)."""
+    out = gh("api", f"repos/{repo}/dependabot/alerts?state=open&per_page=100", "--paginate", "-q",
+             r'.[] | [.security_advisory.severity, .dependency.manifest_path, .dependency.package.name] | @tsv',
+             check=False)
+    if out.returncode != 0:
+        log("Dependabot alerts not readable (the caller needs `vulnerability-alerts: read`); skipped")
+        return ""
+    alerts = [row.split("\t") for row in out.stdout.splitlines() if row.count("\t") == 2]
+    if not alerts:
+        return ""
+    counts = ", ".join(f"{sum(s == sev for s, _, _ in alerts)} {sev}" for sev in ("critical", "high", "medium", "low")
+                       if any(s == sev for s, _, _ in alerts))
+    line = f"**Dependabot:** {len(alerts)} open alert(s) on the repository ({counts})."
+    touched = sorted({m for _, m, _ in alerts if m in changed})
+    for manifest in touched:
+        names = sorted({n for _, m, n in alerts if m == manifest})
+        line += (f" This PR changes `{manifest}`, which has {sum(m == manifest for _, m, _ in alerts)} of them "
+                 f"({', '.join(names[:5])}{', ...' if len(names) > 5 else ''}).")
+    return line
+
+
 def base_context(repo, base_ref):
     parts = []
     for path in CONTEXT_FILES:
@@ -479,7 +501,7 @@ def inline_body(f, is_added_line):
 
 
 def render(result, findings, unanchored, prior_status, errors, cut_short, suppressed, mode, followup, model,
-           elapsed, head_sha, calls, skipped, sampled, broad):
+           elapsed, head_sha, calls, skipped, sampled, broad, alerts=""):
     kinds = [k for k, on in (("release review", mode == "release"), ("broad review of a large PR", broad),
                              ("follow-up", followup)) if on]
     kind = f" ({', '.join(kinds)})" if kinds else ""
@@ -507,6 +529,7 @@ def render(result, findings, unanchored, prior_status, errors, cut_short, suppre
         parts.append(f"**Testing:** {result['testing_notes'].strip()}")
     if (result.get("context_notes") or "").strip():
         parts.append(f"**Project rulebook (CLAUDE.md):** {result['context_notes'].strip()}")
+    parts.append(alerts)
     if errors:
         parts.append("**Incomplete:** these review calls failed and their part was skipped: " + ", ".join(errors))
     if cut_short:
@@ -621,6 +644,8 @@ def main():
     context = base_context(a.repo, meta["baseRefName"])
     ctx_path = write_temp(context) if context else None
 
+    alerts = "" if followup else dependabot_summary(
+        a.repo, {row.split("\t", 2)[2] for row in git(a.workdir, "diff", "--numstat", base, head).splitlines()})
     started = time.time()
     try:
         if followup:
@@ -678,7 +703,7 @@ def main():
         "commit_id": head,
         "event": "COMMENT",
         "body": render(result, findings, unanchored, prior_status, a.errors, a.cut_short, suppressed, a.mode,
-                       followup, a.model, elapsed, head, calls, skipped, sampled, broad),
+                       followup, a.model, elapsed, head, calls, skipped, sampled, broad, alerts),
         "comments": [{"path": f["path"], "line": f["line"], "side": "RIGHT",
                       "body": inline_body(f, valid[f["path"]][f["line"]])} for f in anchored],
     }
