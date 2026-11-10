@@ -1,14 +1,12 @@
 #!/bin/sh
 # Runner-side entrypoint: loads the model API key from the runner user's home and reviews one PR.
-# Called by .github/workflows/review.yml. One review at a time per machine uses the model (the GLM Coding Plan
-# allows very few concurrent requests); other runners wait for the lock before their time budget starts.
+# Called by .github/workflows/review.yml. One review at a time per machine uses the model (model plans often allow
+# very few concurrent requests); other runners wait for the lock before their time budget starts.
 set -eu
 : "${GH_TOKEN:?}" "${REPO:?}" "${PR:?}" "${WORKDIR:?}"
 HERE=$(cd "$(dirname "$0")" && pwd)
 set -a
-for f in "$HOME/.config/glm/zai.env" "$HOME/.config/ai-review/env"; do
-  if [ -f "$f" ]; then . "$f"; fi
-done
+if [ -f "$HOME/.config/ai-review/env" ]; then . "$HOME/.config/ai-review/env"; fi
 set +a
 export PI_CODING_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi-agent}"
 PI="$HOME/pi/pi"
