@@ -10,7 +10,7 @@ machine and every model request leaves from its IP.
 |---|---|---|
 | `secrets` | every push: [gitleaks](https://github.com/gitleaks/gitleaks) scans the lines the PR adds (values redacted in the log) | yes, on a leak |
 | `dependencies` | every push: [osv-scanner](https://github.com/google/osv-scanner) scans the lockfiles the PR changes at the base and at the head and reports only the vulnerabilities the PR adds (`package-lock.json`, `Cargo.lock`, `yarn.lock`, `pnpm-lock.yaml`, `poetry.lock`, `uv.lock`, `Pipfile.lock`, `Gemfile.lock`, `composer.lock`, `go.mod`) | yes, on a new HIGH or CRITICAL one |
-| `gate` | after every review and whenever a review thread is resolved or reopened: red while the bot has unresolved threads on the PR, green when all are resolved | yes, while threads are open |
+| `gate` | after every review, push and label: red while the bot has unresolved threads on the PR, green when all are resolved; after resolving threads, re-run the job or add the `ai-review` label (GitHub has no event for resolving a thread) | yes, while threads are open |
 | `review` | when the PR is opened / marked ready, and again each time you add the `ai-review` label: AI review posted as one PR review by `github-actions[bot]` | no, advisory only |
 
 Pushes do not trigger the AI review. When you are done with the fixes, add the `ai-review` label to the PR; the
@@ -125,8 +125,6 @@ the runner updates itself, and the reviewer code is synced from `main` before ev
      pull_request:
        branches: [main, staging]
        types: [opened, synchronize, reopened, ready_for_review, labeled]
-     pull_request_review_thread:
-       types: [resolved, unresolved]
    concurrency:
      group: ai-review-${{ github.event.pull_request.number }}-${{ github.event.action }}-${{ github.event.label.name }}
      cancel-in-progress: true

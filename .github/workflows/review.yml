@@ -42,7 +42,7 @@ jobs:
     # Deterministic secret scan of the lines this PR adds, on every push; fails the check on a leak (values are redacted).
     if: >-
       github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
-      && github.event_name == 'pull_request' && github.event.action != 'labeled'
+      && github.event.action != 'labeled'
     runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 10
     env:
@@ -78,7 +78,7 @@ jobs:
     # fails the check on HIGH/CRITICAL. Vulnerabilities already on the base branch are not reported.
     if: >-
       github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
-      && github.event_name == 'pull_request' && github.event.action != 'labeled'
+      && github.event.action != 'labeled'
     runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 10
     env:
@@ -159,8 +159,9 @@ jobs:
 
   gate:
     # Red while the bot has unresolved review threads on the PR, green when all are resolved. Runs after every review
-    # and when a thread is resolved or reopened (caller trigger `pull_request_review_thread`). GitHub only blocks the merge
-    # button for it with branch protection (a required check plus required conversation resolution).
+    # and on every push or label; GitHub has no event for resolving a thread, so re-run this job (or add the trigger label)
+    # after resolving. GitHub only blocks the merge button for it with branch protection (a required check plus
+    # required conversation resolution).
     needs: review
     if: >-
       always() && github.event.pull_request.draft == false
