@@ -31,6 +31,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import urllib.parse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -129,10 +130,18 @@ def tracked(total):
     return run
 
 
+TRANSIENT = re.compile(r"HTTP (5\d\d|429)|timed out|timeout|connection|reset by peer|EOF|unreachable|no such host", re.I)
+
+
 def gh(*args, input_text=None, check=True):
-    out = subprocess.run(["gh", *args], input=input_text, capture_output=True, text=True)
+    """gh call; server and network errors are retried twice, a real refusal (4xx) never."""
+    for attempt in range(3):
+        out = subprocess.run(["gh", *args], input=input_text, capture_output=True, text=True)
+        if out.returncode == 0 or attempt == 2 or not TRANSIENT.search(out.stderr):
+            break
+        time.sleep(5 * (attempt + 1))
     if check and out.returncode != 0:
-        sys.exit(f"gh {' '.join(args[:3])} failed: {out.stderr.strip()}")
+        raise RuntimeError(f"gh {' '.join(args[:3])} failed: {out.stderr.strip()}")
     return out
 
 
@@ -171,7 +180,7 @@ def base_context(repo, base_ref):
 def git(workdir, *args):
     out = subprocess.run(["git", "-C", workdir, *args], capture_output=True, text=True, errors="replace")
     if out.returncode != 0:
-        sys.exit(f"git {' '.join(args[:2])} failed: {out.stderr.strip()}")
+        raise RuntimeError(f"git {' '.join(args[:2])} failed: {out.stderr.strip()}")
     return out.stdout
 
 
@@ -469,6 +478,19 @@ def run_pi(a, prompt_files, message, until, where, tools=True):
                       max(until, time.time() + 120), where, tools=False)
 
 
+def retried(fn, where):
+    """A call that failed fast (provider or startup trouble) gets one more try; a slow failure is not paid for twice."""
+    start = time.time()
+    try:
+        return fn()
+    except RuntimeError as e:
+        if time.time() - start > 180:
+            raise
+        log(f"{where} failed ({str(e)[:160]}); trying once more in 30s")
+        time.sleep(30)
+        return fn()
+
+
 def write_temp(text):
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as fh:
         fh.write(text)
@@ -579,7 +601,7 @@ def render(result, findings, overflow, prior_status, errors, cut_short, suppress
     if rows:
         parts.append(findings_table(rows, followup, repo, head_sha))
     if overflow:
-        parts.append(f"**Findings without a thread** (the limit of {MAX_INLINE} comments was reached):\n\n"
+        parts.append("**Findings without a thread** (over the comment limit, or GitHub refused the line):\n\n"
                      + "\n\n".join(finding_block(f) for f in overflow))
     if (result.get("testing_notes") or "").strip():
         parts.append(f"**Tests**\n\n{result['testing_notes'].strip()}")
@@ -651,6 +673,31 @@ def close_fixed_threads(repo, pr, prior_status, threads, head, dry_run):
     return closed
 
 
+def gate(a):
+    """List the bot's unresolved threads and mirror the count in a commit status; never fails the job."""
+    threads = open_bot_threads(a.repo, a.pr)
+    print(f"{len(threads)} unresolved AI review thread(s)")
+    for t in threads:
+        print(f"- {t['title']}")
+    if not a.sha:
+        return
+    state, text = ("pending", f"{len(threads)} unresolved AI review thread(s)") if threads else (
+        "success", "No unresolved AI review threads")
+    out = gh("api", "-X", "POST", f"repos/{a.repo}/statuses/{a.sha}", "-f", f"state={state}",
+             "-f", "context=ai-review/threads", "-f", f"description={text}", check=False)
+    if out.returncode != 0:
+        print("::notice::Commit status not set; the calling workflow needs `statuses: write`.")
+
+
+def skip_review(a, error):
+    """The review could not run: say so on the PR and end quietly, so an outage never becomes a failed run."""
+    traceback.print_exception(error, file=sys.stderr)
+    reason = (str(error).strip().splitlines() or [type(error).__name__])[-1][:200]
+    print(f"::warning::AI review skipped: {reason}")
+    gh("api", "-X", "POST", f"repos/{a.repo}/issues/{a.pr}/comments", "-f",
+       f"body=The AI review could not run ({reason}). Add the `ai-review` label to try again.", check=False)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", required=True)
@@ -664,14 +711,21 @@ def main():
     ap.add_argument("--mode", choices=["feature", "release"], default="feature")
     ap.add_argument("--pi", default="pi")
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--gate", action="store_true", help="only report the bot's unresolved threads; exit 1 if any")
+    ap.add_argument("--gate", action="store_true", help="only report the bot's unresolved threads")
+    ap.add_argument("--sha", help="with --gate: commit that gets the ai-review/threads status")
     a = ap.parse_args()
-    if a.gate:
-        open_threads = open_bot_threads(a.repo, a.pr)
-        print(f"{len(open_threads)} unresolved AI review thread(s)")
-        for t in open_threads:
-            print(f"- {t['title']}")
-        sys.exit(1 if open_threads else 0)
+    try:
+        gate(a) if a.gate else run_review(a)
+    except Exception as e:
+        if a.dry_run:
+            raise
+        if a.gate:
+            print(f"::warning::gate skipped: {e}")
+        else:
+            skip_review(a, e)
+
+
+def run_review(a):
     budget = a.time_budget * 60 or float("inf")
     a.until = time.time() + budget - 30  # leaves time to post the review
     a.errors, a.cut_short = [], False
@@ -737,7 +791,7 @@ def main():
                                            **{k: f.get(k) for k in ("title", "severity", "path", "line")})
                     for i, f in prior_by_id.items()]
     allowed = SEVERITIES[:3] if a.mode == "release" or broad else SEVERITIES
-    findings = [f for f in result.get("findings", []) if f.get("severity") in allowed
+    findings = [f for f in result.get("findings") or [] if f.get("severity") in allowed
                 and (f["severity"] in SEVERITIES[:3] or f.get("prior_id")
                      or (f.get("confidence") or 0) >= MIN_MINOR_CONFIDENCE)]
     for f in findings:
@@ -768,17 +822,23 @@ def main():
         else:
             overflow.append(f)
 
+    def body_with(unplaced):
+        return render(result, findings, unplaced, prior_status, a.errors, a.cut_short, suppressed, a.mode,
+                      followup, a.model, elapsed, head, calls, skipped, sampled, broad, a.repo, alerts)
+
     review = {
         "commit_id": head,
         "event": "COMMENT",
-        "body": render(result, findings, overflow, prior_status, a.errors, a.cut_short, suppressed, a.mode,
-                       followup, a.model, elapsed, head, calls, skipped, sampled, broad, a.repo, alerts),
+        "body": body_with(overflow),
         "comments": [{"path": path, "line": line, "side": "RIGHT", "body": inline_body(f, valid[path][line], moved)}
                      for f, path, line, moved in placed],
     }
     closed = close_fixed_threads(a.repo, a.pr, prior_status, threads, head, a.dry_run)
     # The bot approves only when nothing is left: no finding and no unresolved thread of its own.
-    approve = not findings and not threads and not a.errors and not a.cut_short
+    current = gh("pr", "view", str(a.pr), "-R", a.repo, "--json", "headRefOid", "-q", ".headRefOid").stdout.strip()
+    if current != head:
+        log(f"the PR head moved to {current[:7]} during the review; not approving {head[:7]}")
+    approve = not findings and not threads and not a.errors and not a.cut_short and current == head
     if approve:
         review["event"] = "APPROVE"
     print(json.dumps({"elapsed_s": round(elapsed), "followup": followup, "round": rounds + 1,
@@ -789,13 +849,18 @@ def main():
     if a.dry_run:
         print(json.dumps(review, ensure_ascii=False, indent=2))
         return
-    posted = gh("api", "-X", "POST", f"repos/{a.repo}/pulls/{a.pr}/reviews", "--input", "-",
-                input_text=json.dumps(review), check=not approve)
-    if posted.returncode != 0:
-        log(f"could not approve ({posted.stderr.strip()[:200]}); posting a comment instead")
-        review["event"] = "COMMENT"
-        gh("api", "-X", "POST", f"repos/{a.repo}/pulls/{a.pr}/reviews", "--input", "-", input_text=json.dumps(review))
-    print(f"review posted ({review['event'].lower()})")
+    # Fallbacks: a refused approval becomes a comment; refused line anchors move the findings into the body.
+    variants = [review] + ([dict(review, event="COMMENT")] if approve else []) + [
+        dict(review, event="COMMENT", comments=[], body=body_with(overflow + [f for f, *_ in placed]))]
+    for variant in variants:
+        posted = gh("api", "-X", "POST", f"repos/{a.repo}/pulls/{a.pr}/reviews", "--input", "-",
+                    input_text=json.dumps(variant), check=False)
+        if posted.returncode == 0:
+            break
+        log(f"could not post the {variant['event'].lower()} review ({posted.stderr.strip()[:200]}); trying a simpler one")
+    else:
+        raise RuntimeError(f"posting the review failed: {posted.stderr.strip()[:200]}")
+    print(f"review posted ({variant['event'].lower()}{', without threads' if not variant['comments'] and placed else ''})")
 
 
 def full_review(a, batches, ctx_path, pr_text):
@@ -803,8 +868,8 @@ def full_review(a, batches, ctx_path, pr_text):
     persp = write_temp(perspectives_prompt([p for b in batches for p, _ in b]))
     try:
         prompts = [os.path.join(HERE, "prompts", "review.md"), persp] + ([ctx_path] if ctx_path else [])
-        return tracked(1)("review", lambda: run_pi(
-            a, prompts, pr_text + "\nReview this PR. Return only the JSON object.", a.until, "review"))
+        return tracked(1)("review", lambda: retried(lambda: run_pi(
+            a, prompts, pr_text + "\nReview this PR. Return only the JSON object.", a.until, "review"), "review"))
     finally:
         os.unlink(persp)
 
@@ -820,16 +885,18 @@ def followup_review(a, batches, ctx_path, batch_text, prior):
         mine = [f for f in prior["findings"] if f.get("path") in paths[i] or (i == 0 and f.get("path") not in touched)]
         where = f"follow-up (batch {i + 1}/{len(paths)})"
         try:
-            return track(where, lambda: run_pi(
+            return track(where, lambda: retried(lambda: run_pi(
                 a, [os.path.join(HERE, "prompts", "followup.md")] + ([ctx_path] if ctx_path else []),
                 batch_text(i, dict(prior, findings=mine)) + "\nDo the follow-up review. Return only the JSON object.",
-                a.until, where))
+                a.until, where), where))
         except Exception as e:  # its earlier findings then count as still open
             log(f"{where} failed: {e}")
             a.errors.append(where)
             return {}
     with ThreadPoolExecutor(max_workers=max(1, a.parallel)) as pool:
         parts = list(pool.map(call, range(len(paths))))
+    if len(a.errors) == len(paths):
+        raise RuntimeError("every follow-up call failed")
     return {"summary": " ".join((r.get("summary") or "").strip() for r in parts).strip(),
             "prior_findings": [p for r in parts for p in r.get("prior_findings") or []],
             "findings": [f for r in parts for f in r.get("findings") or []]}
