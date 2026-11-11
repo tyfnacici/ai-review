@@ -892,11 +892,12 @@ def followup_review(a, batches, ctx_path, batch_text, prior):
         except Exception as e:  # its earlier findings then count as still open
             log(f"{where} failed: {e}")
             a.errors.append(where)
+            a.last_error = str(e)
             return {}
     with ThreadPoolExecutor(max_workers=max(1, a.parallel)) as pool:
         parts = list(pool.map(call, range(len(paths))))
     if len(a.errors) == len(paths):
-        raise RuntimeError("every follow-up call failed")
+        raise RuntimeError(f"every follow-up call failed: {a.last_error}")
     return {"summary": " ".join((r.get("summary") or "").strip() for r in parts).strip(),
             "prior_findings": [p for r in parts for p in r.get("prior_findings") or []],
             "findings": [f for r in parts for f in r.get("findings") or []]}
