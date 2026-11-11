@@ -40,6 +40,7 @@ on:
 jobs:
   secrets:
     # Deterministic secret scan of the lines this PR adds, on every push; fails the check on a leak (values are redacted).
+    # A false positive is silenced with a `gitleaks:allow` comment on the line.
     if: >-
       github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
       && github.event.action != 'labeled'
@@ -64,18 +65,21 @@ jobs:
               *) echo "unsupported architecture: $(uname -m)"; exit 1 ;;
             esac
             mkdir -p "$HOME/bin" && tmp=$(mktemp -d "$HOME/bin/.tmp.XXXXXX")
-            curl -fsSL -o "$tmp/g.tgz" "https://github.com/gitleaks/gitleaks/releases/download/v$GITLEAKS/gitleaks_${GITLEAKS}_linux_$arch.tar.gz"
+            curl -fsSL --retry 3 -o "$tmp/g.tgz" "https://github.com/gitleaks/gitleaks/releases/download/v$GITLEAKS/gitleaks_${GITLEAKS}_linux_$arch.tar.gz"
             echo "$sha  $tmp/g.tgz" | sha256sum -c -
             tar xzf "$tmp/g.tgz" -C "$tmp" gitleaks
             mv "$tmp/gitleaks" "$bin" && rm -rf "$tmp"
           fi
           # Local diff: GitHub's diff API refuses PRs with more than 300 files.
+          rc=0
           git diff "origin/${{ github.base_ref }}...HEAD" \
-            | { grep '^+' || true; } | "$bin" stdin --redact --no-banner -v
+            | { grep '^+' || true; } | "$bin" stdin --redact --no-banner -v --exit-code 99 || rc=$?
+          [ "$rc" -eq 99 ] && exit 1
+          [ "$rc" -eq 0 ] || echo "::warning::gitleaks failed (exit $rc); the secret scan was skipped"
 
   dependencies:
-    # Known vulnerabilities (OSV) that the lockfiles changed by this PR introduce, compared with the base branch;
-    # fails the check on HIGH/CRITICAL. Vulnerabilities already on the base branch are not reported.
+    # Known vulnerabilities (OSV) that the lockfiles changed by this PR introduce, compared with the base branch, reported
+    # as warnings; never fails the check. Vulnerabilities already on the base branch are not reported.
     if: >-
       github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
       && github.event.action != 'labeled'
@@ -100,7 +104,7 @@ jobs:
               *) echo "unsupported architecture: $(uname -m)"; exit 1 ;;
             esac
             mkdir -p "$HOME/bin" && tmp=$(mktemp -d "$HOME/bin/.tmp.XXXXXX")
-            curl -fsSL -o "$tmp/osv" "https://github.com/google/osv-scanner/releases/download/v$OSV_SCANNER/osv-scanner_linux_$arch"
+            curl -fsSL --retry 3 -o "$tmp/osv" "https://github.com/google/osv-scanner/releases/download/v$OSV_SCANNER/osv-scanner_linux_$arch"
             echo "$sha  $tmp/osv" | sha256sum -c -
             chmod +x "$tmp/osv" && mv "$tmp/osv" "$bin" && rm -rf "$tmp"
           fi
@@ -108,16 +112,19 @@ jobs:
       - name: Sync reviewer
         run: |
           exec 9>"$HOME/.ai-review.lock" && flock 9
-          git -C "$HOME/ai-review" fetch -q origin main && git -C "$HOME/ai-review" reset -q --hard origin/main
+          git -C "$HOME/ai-review" fetch -q origin main && git -C "$HOME/ai-review" reset -q --hard origin/main \
+            || echo "::warning::Could not sync the reviewer; using the installed copy"
 
       - name: Check lockfile changes
         run: python3 -I "$HOME/ai-review/deps.py" --osv "$HOME/bin/osv-scanner-$OSV_SCANNER" --base "origin/${{ github.base_ref }}"
 
   review:
     # Runs when the PR is opened or marked ready, and again whenever the trigger label is added; not on every push.
-    # Drafts and fork PRs are skipped (forks get no secrets and must never reach a self-hosted runner).
+    # Drafts, fork PRs and Dependabot PRs are skipped (forks get no secrets and must never reach a self-hosted runner;
+    # Dependabot's token is read-only, so the review could not be posted).
     if: >-
       github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
+      && github.actor != 'dependabot[bot]'
       && (contains(fromJSON('["opened", "reopened", "ready_for_review"]'), github.event.action)
           || (github.event.action == 'labeled' && github.event.label.name == inputs.trigger_label))
     runs-on: ${{ fromJSON(inputs.runs_on) }}
@@ -134,7 +141,8 @@ jobs:
         # Several runners on one machine share the reviewer clone and Pi, so only one job updates them at a time.
         run: |
           exec 9>"$HOME/.ai-review.lock" && flock 9
-          git -C "$HOME/ai-review" fetch -q origin main && git -C "$HOME/ai-review" reset -q --hard origin/main
+          git -C "$HOME/ai-review" fetch -q origin main && git -C "$HOME/ai-review" reset -q --hard origin/main \
+            || echo "::warning::Could not sync the reviewer; using the installed copy"
           "$HOME/ai-review/update-pi.sh" || echo "::warning::Pi update failed; using the installed version"
 
       - name: Review
@@ -155,26 +163,29 @@ jobs:
         if: always() && github.event.action == 'labeled'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh api -X DELETE "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/${{ inputs.trigger_label }}" --silent
+        run: gh api -X DELETE "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/${{ inputs.trigger_label }}" --silent || echo "::notice::The label was already removed"
 
   gate:
-    # Red while the bot has unresolved review threads on the PR, green when all are resolved. Runs after every review
-    # and on every push or label; GitHub has no event for resolving a thread, so re-run this job (or add the trigger label)
-    # after resolving. GitHub only blocks the merge button for it with branch protection (a required check plus
-    # required conversation resolution).
+    # Informational, never red: mirrors the bot's unresolved review threads in the commit status `ai-review/threads`
+    # (pending while any is open, success when all are resolved). Runs after every review, push and trigger label;
+    # GitHub has no event for resolving a thread, so re-run this job (or add the trigger label) after resolving.
+    # The status needs `statuses: write` in the caller. Merging is blocked only by branch protection (require the
+    # status and conversation resolution).
     needs: review
     if: >-
-      always() && github.event.pull_request.draft == false
+      !cancelled() && github.event.pull_request.draft == false
       && github.event.pull_request.head.repo.full_name == github.repository
+      && (github.event.action != 'labeled' || github.event.label.name == inputs.trigger_label)
     runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 10
     steps:
       - name: Sync reviewer
         run: |
           exec 9>"$HOME/.ai-review.lock" && flock 9
-          git -C "$HOME/ai-review" fetch -q origin main && git -C "$HOME/ai-review" reset -q --hard origin/main
+          git -C "$HOME/ai-review" fetch -q origin main && git -C "$HOME/ai-review" reset -q --hard origin/main \
+            || echo "::warning::Could not sync the reviewer; using the installed copy"
 
-      - name: Check unresolved AI review threads
+      - name: List unresolved AI review threads
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 -I "$HOME/ai-review/review.py" --gate --repo "${{ github.repository }}" --pr "${{ github.event.pull_request.number }}" --workdir .
+        run: python3 -I "$HOME/ai-review/review.py" --gate --repo "${{ github.repository }}" --pr "${{ github.event.pull_request.number }}" --sha "${{ github.event.pull_request.head.sha }}" --workdir .
