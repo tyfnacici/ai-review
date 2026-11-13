@@ -1,0 +1,195 @@
+name: AI review
+
+# Reusable workflow. Callers grant `contents: write` (only to resolve fixed review threads) + `pull-requests: write`.
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: Runner labels as a JSON list
+        type: string
+        default: '["self-hosted", "ai-review"]'
+      model:
+        description: Pi model spec (provider/model)
+        type: string
+        default: zai/glm-5.3-flash
+      thinking:
+        description: Pi thinking level
+        type: string
+        default: medium
+      parallel:
+        description: Follow-up calls at once for a large follow-up; keep 1 on plans with low concurrency
+        type: number
+        default: 1
+      batch_chars:
+        description: Diff characters per review call; larger diffs are split into batches
+        type: number
+        default: 120000
+      time_budget:
+        description: Minutes for the whole review; calls still running at the end are stopped (0 = no limit)
+        type: number
+        default: 15
+      release_from:
+        description: PRs whose head is this branch get a release review (combined effect); all others a feature review
+        type: string
+        default: staging
+      trigger_label:
+        description: Adding this label to a PR runs the review again (follow-up); the label is removed afterwards
+        type: string
+        default: ai-review
+
+jobs:
+  secrets:
+    # Deterministic secret scan of the lines this PR adds, on every push; fails the check on a leak (values are redacted).
+    # A false positive is silenced with a `gitleaks:allow` comment on the line.
+    if: >-
+      github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
+      && (github.event.repository.private || github.event.pull_request.user.login == github.repository_owner)
+      && github.event.action != 'labeled'
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 10
+    env:
+      GITLEAKS: 8.30.1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scan added lines with gitleaks
+        run: |
+          bin="$HOME/bin/gitleaks-$GITLEAKS"
+          if [ ! -x "$bin" ]; then
+            case $(uname -m) in
+              aarch64|arm64) arch=arm64 sha=e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080 ;;
+              x86_64) arch=x64 sha=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb ;;
+              *) echo "unsupported architecture: $(uname -m)"; exit 1 ;;
+            esac
+            mkdir -p "$HOME/bin" && tmp=$(mktemp -d "$HOME/bin/.tmp.XXXXXX")
+            curl -fsSL --retry 3 -o "$tmp/g.tgz" "https://github.com/gitleaks/gitleaks/releases/download/v$GITLEAKS/gitleaks_${GITLEAKS}_linux_$arch.tar.gz"
+            echo "$sha  $tmp/g.tgz" | sha256sum -c -
+            tar xzf "$tmp/g.tgz" -C "$tmp" gitleaks
+            mv "$tmp/gitleaks" "$bin" && rm -rf "$tmp"
+          fi
+          # Local diff: GitHub's diff API refuses PRs with more than 300 files.
+          rc=0
+          git diff "origin/${{ github.base_ref }}...HEAD" \
+            | { grep '^+' || true; } | "$bin" stdin --redact --no-banner -v --exit-code 99 || rc=$?
+          [ "$rc" -eq 99 ] && exit 1
+          [ "$rc" -eq 0 ] || echo "::warning::gitleaks failed (exit $rc); the secret scan was skipped"
+
+  dependencies:
+    # Known vulnerabilities (OSV) that the lockfiles changed by this PR introduce, compared with the base branch, reported
+    # as warnings; never fails the check. Vulnerabilities already on the base branch are not reported.
+    if: >-
+      github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
+      && (github.event.repository.private || github.event.pull_request.user.login == github.repository_owner)
+      && github.event.action != 'labeled'
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 10
+    env:
+      OSV_SCANNER: 2.7.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install osv-scanner
+        run: |
+          bin="$HOME/bin/osv-scanner-$OSV_SCANNER"
+          if [ ! -x "$bin" ]; then
+            case $(uname -m) in
+              aarch64|arm64) arch=arm64 sha=4061ef4c021ed3c47f203b818f337e351336cc5cd67c0274fc36bd1dfc728dd7 ;;
+              x86_64) arch=amd64 sha=160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b ;;
+              *) echo "unsupported architecture: $(uname -m)"; exit 1 ;;
+            esac
+            mkdir -p "$HOME/bin" && tmp=$(mktemp -d "$HOME/bin/.tmp.XXXXXX")
+            curl -fsSL --retry 3 -o "$tmp/osv" "https://github.com/google/osv-scanner/releases/download/v$OSV_SCANNER/osv-scanner_linux_$arch"
+            echo "$sha  $tmp/osv" | sha256sum -c -
+            chmod +x "$tmp/osv" && mv "$tmp/osv" "$bin" && rm -rf "$tmp"
+          fi
+
+      - name: Sync reviewer
+        run: |
+          exec 9>"$HOME/.ai-review.lock" && flock 9
+          git -C "$HOME/ai-review" fetch -q origin main && git -C "$HOME/ai-review" reset -q --hard origin/main \
+            || echo "::warning::Could not sync the reviewer; using the installed copy"
+
+      - name: Check lockfile changes
+        run: python3 -I "$HOME/ai-review/deps.py" --osv "$HOME/bin/osv-scanner-$OSV_SCANNER" --base "origin/${{ github.base_ref }}"
+
+  review:
+    # Runs when the PR is opened or marked ready, and again whenever the trigger label is added; not on every push.
+    # Drafts, fork PRs and Dependabot PRs are skipped (forks get no secrets and must never reach a self-hosted runner;
+    # Dependabot's token is read-only, so the review could not be posted).
+    if: >-
+      github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
+      && (github.event.repository.private || github.event.pull_request.user.login == github.repository_owner)
+      && github.actor != 'dependabot[bot]'
+      && (contains(fromJSON('["opened", "reopened", "ready_for_review"]'), github.event.action)
+          || (github.event.action == 'labeled' && github.event.label.name == inputs.trigger_label))
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    # One agent run per review (a large PR gets a broad review) within time_budget, plus waiting for the model lock.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Sync reviewer and Pi
+        # Several runners on one machine share the reviewer clone and Pi, so only one job updates them at a time.
+        run: |
+          exec 9>"$HOME/.ai-review.lock" && flock 9
+          git -C "$HOME/ai-review" fetch -q origin main && git -C "$HOME/ai-review" reset -q --hard origin/main \
+            || echo "::warning::Could not sync the reviewer; using the installed copy"
+          "$HOME/ai-review/update-pi.sh" || echo "::warning::Pi update failed; using the installed version"
+
+      - name: Review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          WORKDIR: ${{ github.workspace }}
+          MODEL: ${{ inputs.model }}
+          THINKING: ${{ inputs.thinking }}
+          PARALLEL: ${{ inputs.parallel }}
+          BATCH_CHARS: ${{ inputs.batch_chars }}
+          TIME_BUDGET: ${{ inputs.time_budget }}
+          MODE: ${{ github.head_ref == inputs.release_from && 'release' || 'feature' }}
+        run: '"$HOME/ai-review/run.sh"'
+
+      - name: Remove trigger label
+        if: always() && github.event.action == 'labeled'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X DELETE "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/${{ inputs.trigger_label }}" --silent || echo "::notice::The label was already removed"
+
+  gate:
+    # Informational, never red: mirrors the bot's unresolved review threads in the commit status `ai-review/threads`
+    # (pending while any is open, success when all are resolved). Runs after every review, push and trigger label;
+    # GitHub has no event for resolving a thread, so re-run this job (or add the trigger label) after resolving.
+    # The status needs `statuses: write` in the caller. Merging is blocked only by branch protection (require the
+    # status and conversation resolution).
+    needs: review
+    if: >-
+      !cancelled() && github.event.pull_request.draft == false
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && (github.event.repository.private || github.event.pull_request.user.login == github.repository_owner)
+      && (github.event.action != 'labeled' || github.event.label.name == inputs.trigger_label)
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 10
+    steps:
+      - name: Sync reviewer
+        run: |
+          exec 9>"$HOME/.ai-review.lock" && flock 9
+          git -C "$HOME/ai-review" fetch -q origin main && git -C "$HOME/ai-review" reset -q --hard origin/main \
+            || echo "::warning::Could not sync the reviewer; using the installed copy"
+
+      - name: List unresolved AI review threads
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I "$HOME/ai-review/review.py" --gate --repo "${{ github.repository }}" --pr "${{ github.event.pull_request.number }}" --sha "${{ github.event.pull_request.head.sha }}" --workdir .
