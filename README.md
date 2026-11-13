@@ -293,7 +293,8 @@ in `run.sh` already makes one review at a time use the model, which suits a sing
 
 - **Your key stays on your machine.** It lives in a file of the runner user (mode 600) and is never given to GitHub. Only
   the model provider you configure receives code.
-- **No fork PRs, no drafts.** Their jobs are skipped, so untrusted code never runs on the runner.
+- **No fork PRs, no drafts.** Their jobs are skipped, so untrusted code never runs on the runner. On a public
+  repository only PRs opened by the repository owner are reviewed.
 - **The agent can only read.** Pi runs with `read`, `grep`, `find` and `ls`, offline mode, and no session storage. PR
   title, description, comments and diff are treated as untrusted data; instructions inside them are not followed.
 - **The rulebook comes from the base branch**, so a PR cannot weaken its own review.
